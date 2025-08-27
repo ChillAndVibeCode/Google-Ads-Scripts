@@ -1,0 +1,279 @@
+/**
+ * @name Automatic US State Targeting (All Campaign Types)
+ * @description This script identifies active campaigns targeting "United States"
+ * and replaces this with targeting for all 50 US states + Washington D.C.
+ * This version includes a handler for Performance Max campaigns.
+ *
+ * @version 4.0
+ * @author 
+ */
+
+// =================================================================================
+// GLOBAL SETTINGS
+// =================================================================================
+
+// The Geo ID for "United States" (Country) in the Google Ads API.
+const US_COUNTRY_ID = 2840;
+
+// VERIFIED list of geographic targeting IDs for all 50 US states + Washington D.C.
+const US_STATES_IDS = [
+    21134, // Alabama
+    21135, // Alaska
+    21136, // Arizona
+    21137, // Arkansas
+    21138, // California
+    21139, // Colorado
+    21140, // Connecticut
+    21142, // Delaware
+    1015116, // District of Columbia
+    21143, // Florida
+    21144, // Georgia
+    21145, // Hawaii
+    21146, // Idaho
+    21147, // Illinois
+    21148, // Indiana
+    21149, // Iowa
+    21150, // Kansas
+    21151, // Kentucky
+    21152, // Louisiana
+    21153, // Maine
+    21154, // Maryland
+    21155, // Massachusetts
+    21156, // Michigan
+    21157, // Minnesota
+    21158, // Mississippi
+    21159, // Missouri
+    21160, // Montana
+    21161, // Nebraska
+    21162, // Nevada
+    21163, // New Hampshire
+    21164, // New Jersey
+    21165, // New Mexico
+    21166, // New York
+    21167, // North Carolina
+    21168, // North Dakota
+    21169, // Ohio
+    21170, // Oklahoma
+    21171, // Oregon
+    21172, // Pennsylvania
+    21174, // Rhode Island
+    21175, // South Carolina
+    21176, // South Dakota
+    21177, // Tennessee
+    21178, // Texas
+    21179, // Utah
+    21180, // Vermont
+    21181, // Virginia
+    21182, // Washington
+    21183, // West Virginia
+    21184, // Wisconsin
+    21185  // Wyoming
+];
+
+
+// Counters for the final report
+let processedCount = 0;
+let skippedCount = 0;
+let errorCount = 0;
+
+// =================================================================================
+// MAIN FUNCTION
+// =================================================================================
+
+function main() {
+  Logger.log('--- STARTING STATE TARGETING SCRIPT (v4.0 - PMax Compatible) ---');
+  
+  // =================================================================================
+  // PHASE 1: ANALYSIS - Collect location and type data from ALL active campaigns.
+  // =================================================================================
+  const campaignLocationData = new Map();
+  
+  // *** MODIFIED QUERY ***: Added campaign.advertising_channel_type to identify PMax campaigns.
+  const gaqlQuery = `
+    SELECT
+      campaign.id,
+      campaign.name,
+      campaign.advertising_channel_type,
+      campaign_criterion.location.geo_target_constant,
+      campaign_criterion.negative
+    FROM campaign_criterion
+    WHERE campaign.status = 'ENABLED' AND campaign_criterion.type = 'LOCATION'`;
+
+  Logger.log('PHASE 1: Executing GAQL query to collect location and type data from all active campaigns...');
+  
+  try {
+    const gaqlIterator = AdsApp.search(gaqlQuery);
+    let rowsProcessed = 0;
+
+    while (gaqlIterator.hasNext()) {
+      const row = gaqlIterator.next();
+      const campaignId = row.campaign.id;
+      const campaignName = row.campaign.name;
+      const channelType = row.campaign.advertisingChannelType;
+      const locationResourceName = row.campaignCriterion.location.geoTargetConstant;
+      const isNegative = row.campaignCriterion.negative;
+
+      if (!locationResourceName) {
+        Logger.log(`WARNING: Location criterion without a resource name for Campaign ID: ${campaignId}. Skipping.`);
+        continue;
+      }
+
+      const locationId = parseInt(locationResourceName.split('/')[1]);
+
+      if (!campaignLocationData.has(campaignId)) {
+        campaignLocationData.set(campaignId, {
+          name: campaignName,
+          channelType: channelType,
+          positives: new Set(),
+          negatives: new Set(),
+        });
+      }
+
+      const data = campaignLocationData.get(campaignId);
+      if (isNegative) {
+        data.negatives.add(locationId);
+      } else {
+        data.positives.add(locationId);
+      }
+      rowsProcessed++;
+    }
+    Logger.log(`PHASE 1: Collection complete. ${rowsProcessed} location criteria rows processed.`);
+    Logger.log(`Total unique campaigns with location data found: ${campaignLocationData.size}`);
+
+  } catch (e) {
+    Logger.log(`FATAL ERROR IN PHASE 1: The GAQL query failed: ${e.message}. Stack: ${e.stack}`);
+    Logger.log('The script cannot continue. Check query syntax, account permissions, or API status.');
+    return;
+  }
+
+  // =================================================================================
+  // PHASE 2 & 3: FILTERING AND EXECUTION
+  // =================================================================================
+  Logger.log('\nPHASE 2/3: Analyzing, filtering, and modifying campaigns...');
+
+  for (const [campaignId, data] of campaignLocationData.entries()) {
+    const { name, positives, negatives, channelType } = data;
+    Logger.log(`\n- Analyzing: "${name}" (ID: ${campaignId}, Type: ${channelType})`);
+
+    const meetsCriteria = positives.size === 1 && positives.has(US_COUNTRY_ID) && negatives.size === 0;
+
+    if (meetsCriteria) {
+      Logger.log(`  [✅ ELIGIBLE] - Campaign targets only USA with no exclusions. Preparing for execution.`);
+      try {
+        const campaignIterator = AdsApp.campaigns().withIds([campaignId]).get();
+        if (campaignIterator.hasNext()) {
+          const campaign = campaignIterator.next();
+          
+          // *** NEW LOGIC BRANCH ***: Handle PMax and Standard campaigns differently.
+          if (channelType === 'PERFORMANCE_MAX') {
+            handlePmaxCampaign(campaign);
+          } else {
+            handleStandardCampaign(campaign);
+          }
+          processedCount++;
+        } else {
+           Logger.log(`  [❌ ERROR] Could not find the campaign object with ID ${campaignId}. It may have been removed or moved.`);
+           errorCount++;
+        }
+      } catch (e) {
+        Logger.log(`  [❌ ERROR] Failed to modify campaign "${name}" (ID: ${campaignId}): ${e.message}. Stack: ${e.stack}`);
+        errorCount++;
+      }
+    } else {
+      let reason = "Criteria not met.";
+      if(positives.size !== 1) reason = `Has ${positives.size} positive targets (expected: 1).`;
+      else if (!positives.has(US_COUNTRY_ID)) reason = `The positive target is not 'United States' (ID: ${US_COUNTRY_ID}).`;
+      else if (negatives.size > 0) reason = `Has ${negatives.size} negative exclusions (expected: 0).`;
+      Logger.log(`  [⏭️ SKIPPED] - ${reason}`);
+      skippedCount++;
+    }
+  }
+
+  // =================================================================================
+  // Final Report
+  // =================================================================================
+  Logger.log('\n--- FINAL REPORT ---');
+  Logger.log(`Total campaigns analyzed: ${campaignLocationData.size}`);
+  Logger.log(`✅ Campaigns successfully modified: ${processedCount}`);
+  Logger.log(`⏭️ Campaigns skipped (not eligible): ${skippedCount}`);
+  Logger.log(`❌ Campaigns with errors during modification: ${errorCount}`);
+  Logger.log('--- SCRIPT COMPLETE ---');
+}
+
+
+// =================================================================================
+// HELPER FUNCTIONS
+// =================================================================================
+
+/**
+ * Modifies standard campaigns (Search, Display, etc.) using addLocation/removeLocation.
+ * @param {GoogleAdsApp.Campaign} campaign The campaign object to modify.
+ */
+function handleStandardCampaign(campaign) {
+  Logger.log(`    - Using standard method for campaign type: ${campaign.getEntityType()}`);
+  
+  // Safely remove the old location target
+  try {
+      campaign.removeLocation(US_COUNTRY_ID);
+      Logger.log(`    - "United States" (ID: ${US_COUNTRY_ID}) successfully removed from campaign "${campaign.getName()}".`);
+  } catch (removeError) {
+      Logger.log(`    WARNING: Failed to remove "United States" from campaign "${campaign.getName()}". Reason: ${removeError.message}.`);
+  }
+  
+  Logger.log(`    - Adding ${US_STATES_IDS.length} US states...`);
+  for (const stateId of US_STATES_IDS) {
+      try {
+          campaign.addLocation(stateId);
+      } catch (e) {
+          Logger.log(`    ERROR adding state with ID ${stateId} to campaign "${campaign.getName()}". Reason: ${e.message}`);
+      }
+  }
+  Logger.log(`    - Success! Campaign "${campaign.getName()}" updated with state-level targeting.`);
+}
+
+/**
+ * Modifies Performance Max campaigns using Asset Sets.
+ * @param {GoogleAdsApp.Campaign} campaign The PMax campaign object to modify.
+ */
+function handlePmaxCampaign(campaign) {
+    Logger.log(`    - Using PMax method for campaign "${campaign.getName()}".`);
+
+    // 1. Remove the old "United States" CampaignCriterion
+    const campaignCriteria = campaign.targeting().targetedLocations().get();
+    let removed = false;
+    while(campaignCriteria.hasNext()){
+        const criterion = campaignCriteria.next();
+        if(criterion.getId() === US_COUNTRY_ID){
+            criterion.remove();
+            Logger.log(`    - "United States" criterion (ID: ${US_COUNTRY_ID}) removed.`);
+            removed = true;
+        }
+    }
+    if(!removed) {
+        Logger.log(`    - WARNING: Could not find the "United States" criterion to remove.`);
+    }
+
+    // 2. Create a new Location Group Asset Set
+    const assetSetName = `All US States - ${campaign.getName()} - ${new Date().getTime()}`;
+    const locationAssetSetBuilder = AdsApp.newAssetSetBuilder()
+      .withName(assetSetName)
+      .withType('LOCATION_GROUP');
+
+    const assetSetOperation = locationAssetSetBuilder.build();
+    if (!assetSetOperation.isSuccessful()) {
+        throw new Error(`Failed to create Asset Set: ${assetSetOperation.getErrors().join(', ')}`);
+    }
+    const assetSet = assetSetOperation.getResult();
+    Logger.log(`    - Created new location asset set: "${assetSetName}"`);
+
+    // 3. Add all state geo targets to the new Asset Set
+    for (const stateId of US_STATES_IDS) {
+        // The asset for a location is its geo target constant resource name
+        assetSet.addAsset('googleAds/geoTargetConstants/' + stateId);
+    }
+    Logger.log(`    - Added ${US_STATES_IDS.length} states to the asset set.`);
+
+    // 4. Link the new Asset Set to the PMax campaign
+    campaign.addAssetSet(assetSet);
+    Logger.log(`    - Successfully linked new asset set to campaign "${campaign.getName()}".`);
+}

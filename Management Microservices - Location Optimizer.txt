@@ -1,0 +1,160 @@
+/**
+ * @name Wasted Spend Location Excluder
+ * @description Finds locations with zero conversions and high spend relative to converting
+ * locations, and excludes them from all enabled non-PMax campaigns.
+ * @version 3.1 - Flexible Date Range
+ * @author 
+ */
+
+// =================================================================================
+// CONFIGURATION
+// =================================================================================
+const CONFIG = {
+  // *** MODIFIED ***: Define the number of days to look back for performance analysis.
+  LOOKBACK_DAYS: 180,
+
+  // Define the tolerance for wasted spend.
+  // For example, 50 means a location with 0 conversions will be excluded if
+  // it has spent more than 50% of the average spend for a location that DID convert.
+  WASTED_SPEND_THRESHOLD_PERCENTAGE: 50,
+};
+
+// =================================================================================
+// MAIN FUNCTION
+// =================================================================================
+function main() {
+  Logger.log(`--- Starting Wasted Spend Location Excluder (Lookback: ${CONFIG.LOOKBACK_DAYS} days) ---`);
+  
+  const analysisResults = analyzeLocationSpend();
+  
+  if (analysisResults.wastefulLocations.length === 0) {
+    Logger.log('No wasteful locations found meeting the criteria. No changes made.');
+  } else {
+    Logger.log(`Found ${analysisResults.wastefulLocations.length} wasteful locations to exclude.`);
+    excludeLocationsFromCampaigns(analysisResults.wastefulLocations);
+  }
+  
+  Logger.log('--- Script Finished ---');
+}
+
+/**
+ * Analyzes location performance to calculate a spend threshold and identify wasteful locations.
+ * @returns {{wastefulLocations: string[]}} An object containing the list of wasteful location resource names.
+ */
+function analyzeLocationSpend() {
+  // *** NEW ***: Get the formatted start and end dates for the query.
+  const { startDate, endDate } = getFormattedDateRange();
+  
+  // *** MODIFIED ***: The query now uses a BETWEEN clause for the flexible date range.
+  const query = `
+    SELECT
+      campaign_criterion.location.geo_target_constant,
+      metrics.cost_micros,
+      metrics.conversions
+    FROM location_view
+    WHERE
+      campaign.status = 'ENABLED'
+      AND campaign_criterion.is_negative = false
+      AND segments.date BETWEEN '${startDate}' AND '${endDate}'`;
+      
+  const report = AdsApp.search(query);
+  
+  let totalCostOfConvertingLocations = 0;
+  let countOfConvertingLocations = 0;
+  const nonConvertingLocations = [];
+
+  Logger.log(`Analyzing location data from ${startDate} to ${endDate}...`);
+  while(report.hasNext()) {
+    const row = report.next();
+    const cost = row.metrics.costMicros / 1000000;
+    const conversions = row.metrics.conversions;
+    const locationResource = row.campaignCriterion.location.geo_target_constant;
+    
+    if (!locationResource) continue;
+
+    if (conversions > 0) {
+      totalCostOfConvertingLocations += cost;
+      countOfConvertingLocations++;
+    } else {
+      nonConvertingLocations.push({ resource: locationResource, cost: cost });
+    }
+  }
+
+  if (countOfConvertingLocations === 0) {
+    Logger.log('No converting locations found in the date range. Cannot determine a spend threshold. Aborting.');
+    return { wastefulLocations: [] };
+  }
+  
+  const averageSpendForConvertingLocation = totalCostOfConvertingLocations / countOfConvertingLocations;
+  const spendThreshold = averageSpendForConvertingLocation * (CONFIG.WASTED_SPEND_THRESHOLD_PERCENTAGE / 100);
+
+  Logger.log(`Benchmark calculated:`);
+  Logger.log(`- Average spend for a converting location: $${averageSpendForConvertingLocation.toFixed(2)}`);
+  Logger.log(`- Wasteful spend threshold set at ${CONFIG.WASTED_SPEND_THRESHOLD_PERCENTAGE}%: $${spendThreshold.toFixed(2)}`);
+  Logger.log('---');
+
+  const wastefulLocations = [];
+  for (const location of nonConvertingLocations) {
+    if (location.cost > spendThreshold) {
+      wastefulLocations.push(location.resource);
+      Logger.log(`  [!] WASTE DETECTED: Location ${location.resource.split('/')[1]} spent $${location.cost.toFixed(2)} with 0 conversions. Adding to exclusion list.`);
+    }
+  }
+  
+  return { wastefulLocations };
+}
+
+/**
+ * Excludes the given list of locations from all enabled, non-PMax campaigns.
+ * @param {string[]} locationResourceNames The array of location resource names to exclude.
+ */
+function excludeLocationsFromCampaigns(locationResourceNames) {
+  Logger.log('\n--- Applying location exclusions to campaigns ---');
+  
+  const campaignIterator = AdsApp.campaigns()
+    .withCondition("campaign.status = 'ENABLED'")
+    .withCondition("campaign.advertising_channel_type != 'PERFORMANCE_MAX'")
+    .get();
+    
+  while (campaignIterator.hasNext()) {
+    const campaign = campaignIterator.next();
+    Logger.log(`Processing campaign: "${campaign.getName()}"`);
+    
+    let excludedCount = 0;
+    for (const locationResource of locationResourceNames) {
+      const locationId = locationResource.split('/')[1];
+      campaign.excludeLocation(parseInt(locationId, 10));
+      excludedCount++;
+    }
+    Logger.log(`  - Applied ${excludedCount} new location exclusion(s).`);
+  }
+}
+
+// *** NEW ***: Helper function to calculate and format date strings.
+/**
+ * Calculates date range based on LOOKBACK_DAYS and formats it for GAQL.
+ * @returns {{startDate: string, endDate: string}}
+ */
+function getFormattedDateRange() {
+  const lookback = CONFIG.LOOKBACK_DAYS;
+  const now = new Date();
+  const yesterday = new Date(now.getTime() - (24 * 60 * 60 * 1000));
+  const pastDate = new Date(now.getTime() - (lookback * 24 * 60 * 60 * 1000));
+
+  return {
+    startDate: formatDate(pastDate),
+    endDate: formatDate(yesterday),
+  };
+}
+
+/**
+ * Formats a Date object into 'YYYYMMDD' string.
+ * @param {Date} date The date to format.
+ * @returns {string} The formatted date string.
+ */
+function formatDate(date) {
+  const year = date.getFullYear();
+  const month = ('0' + (date.getMonth() + 1)).slice(-2);
+  const day = ('0' + date.getDate()).slice(-2);
+  return `${year}${month}${day}`;
+}

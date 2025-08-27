@@ -1,0 +1,404 @@
+// Copyright 2024, Google Inc. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/**
+ * @name BFCM Performance Analyzer
+ *
+ * @overview This script analyzes Google Ads performance during Black Friday &
+ * Cyber Monday of the previous year, compares it to the preceding period,
+ * and exports a summary to a Google Spreadsheet, including top-selling products.
+ *
+ * @author Google Ads Scripts Team
+ *
+ * @version 1.3 (Added Top 5 Brands)
+ *
+ * @changelog
+ * - version 1.3
+ *   - Added Top 5 Brands report.
+ * - version 1.2
+ *   - Corrected 'segments.product_type_level1' to the valid field 'segments.product_type_l1'.
+ * - version 1.1
+ *   - Added Top 5 Product Types report, using safe, manual aggregation.
+ * - version 1.0
+ *   - Released initial version.
+ */
+
+//--//--//--//--//--//--//--//--//--//--//--//--//--//--//--//
+// CONFIGURATION
+//--//--//--//--//--//--//--//--//--//--//--//--//--//--//--//
+
+const SPREADSHEET_URL = 'YOUR_SPREADSHEET_URL'; // e.g. 'https://docs.google.com/spreadsheets/d/1234567890/edit'
+const SUMMARY_SHEET_NAME = 'BFCM_Analysis';
+const DAILY_SHEET_NAME = 'Daily_Breakdown';
+const PRODUCT_SHEET_NAME = 'Top_5_Products';
+const PRODUCT_TYPE_SHEET_NAME = 'Top_5_Product_Types';
+const BRAND_SHEET_NAME = 'Top_5_Brands'; // --- ADDED ---
+
+
+// BFCM period for the previous year
+const BFCM_START_DATE = '2024-11-29';
+const BFCM_END_DATE = '2024-12-02';
+
+
+function main() {
+  const spreadsheet = validateAndGetSpreadsheet(SPREADSHEET_URL);
+  spreadsheet.setSpreadsheetTimeZone(AdsApp.currentAccount().getTimeZone());
+
+  const bfcmDateRange = getDateRange(BFCM_START_DATE, BFCM_END_DATE);
+  const comparisonDateRange = getComparisonDateRange(bfcmDateRange);
+
+  // Fetch aggregated and daily data
+  const bfcmTotals = getAccountTotals(bfcmDateRange);
+  const comparisonTotals = getAccountTotals(comparisonDateRange);
+  const bfcmDailyData = getDailyStats(bfcmDateRange);
+
+  const topProducts = getTopSellingProducts(bfcmDateRange);
+  const topProductTypes = getTopSellingProductTypes(bfcmDateRange);
+  const topBrands = getTopSellingBrands(bfcmDateRange); // --- ADDED ---
+
+
+  // Write all data to the spreadsheet
+  writeSummaryToSheet(spreadsheet, bfcmTotals, comparisonTotals, bfcmDateRange, comparisonDateRange);
+  writeDailyBreakdownToSheet(spreadsheet, bfcmDailyData);
+  writeProductsToSheet(spreadsheet, topProducts);
+  writeProductTypesToSheet(spreadsheet, topProductTypes);
+  writeBrandsToSheet(spreadsheet, topBrands); // --- ADDED ---
+
+}
+
+/**
+ * Fetches aggregated, account-level metrics for a given date range.
+ */
+function getAccountTotals(dateRange) {
+  const query = `
+    SELECT
+      metrics.clicks,
+      metrics.impressions,
+      metrics.conversions,
+      metrics.all_conversions_value,
+      metrics.cost_micros
+    FROM customer
+    WHERE segments.date BETWEEN '${dateRange.startDate}' AND '${dateRange.endDate}'`;
+
+  const report = AdsApp.report(query);
+  const rows = report.rows();
+  if (rows.hasNext()) {
+    const row = rows.next();
+    const cost = (row['metrics.cost_micros'] || 0) / 1e6;
+    const clicks = row['metrics.clicks'] || 0;
+    const impressions = row['metrics.impressions'] || 0;
+    const conversions = row['metrics.conversions'] || 0;
+    const conversionValue = row['metrics.all_conversions_value'] || 0;
+
+    return {
+        ctr: impressions > 0 ? clicks / impressions : 0,
+        conversionRate: clicks > 0 ? conversions / clicks : 0,
+        conversionValue: conversionValue,
+        roas: cost > 0 ? conversionValue / cost : 0,
+        cost: cost,
+    };
+  }
+  return { ctr: 0, conversionRate: 0, conversionValue: 0, roas: 0, cost: 0 };
+}
+
+/**
+ * Fetches daily, account-level metrics for the BFCM date range.
+ */
+function getDailyStats(dateRange) {
+  const query = `
+    SELECT
+      segments.date,
+      metrics.clicks,
+      metrics.impressions,
+      metrics.conversions,
+      metrics.all_conversions_value,
+      metrics.cost_micros
+    FROM customer
+    WHERE segments.date BETWEEN '${dateRange.startDate}' AND '${dateRange.endDate}'
+    ORDER BY segments.date ASC`;
+
+    const report = AdsApp.report(query);
+    const dailyData = [];
+    for (const row of report.rows()) {
+        const cost = (row['metrics.cost_micros'] || 0) / 1e6;
+        const clicks = row['metrics.clicks'] || 0;
+        const impressions = row['metrics.impressions'] || 0;
+        const conversions = row['metrics.conversions'] || 0;
+        const conversionValue = row['metrics.all_conversions_value'] || 0;
+
+        dailyData.push({
+            date: row['segments.date'],
+            ctr: impressions > 0 ? clicks / impressions : 0,
+            conversionRate: clicks > 0 ? conversions / clicks : 0,
+            conversionValue: conversionValue,
+            roas: cost > 0 ? conversionValue / cost : 0,
+            cost: cost,
+        });
+    }
+    return dailyData;
+}
+
+
+/**
+ * Fetches top 5 selling products by conversion value during the BFCM period.
+ */
+function getTopSellingProducts(dateRange) {
+  const query = `
+    SELECT
+      segments.product_item_id,
+      metrics.all_conversions_value
+    FROM shopping_performance_view
+    WHERE
+      segments.date BETWEEN '${dateRange.startDate}' AND '${dateRange.endDate}'
+    ORDER BY
+      metrics.all_conversions_value DESC
+    LIMIT 5`;
+
+  const products = [];
+  try {
+      const report = AdsApp.report(query);
+      for (const row of report.rows()) {
+          products.push({
+              itemId: row['segments.product_item_id'],
+              conversionValue: row['metrics.all_conversions_value']
+          });
+      }
+  } catch(e) {
+      Logger.log(`Could not fetch top product data. Shopping campaigns may not be in use. Error: ${e}`);
+  }
+  return products;
+}
+
+/**
+ * Fetches and aggregates the top selling product types. This function manually
+ * aggregates results to avoid API limitations with sorting and grouping.
+ */
+function getTopSellingProductTypes(dateRange) {
+    const query = `
+      SELECT segments.product_type_l1, metrics.all_conversions_value
+      FROM shopping_performance_view
+      WHERE segments.date BETWEEN '${dateRange.startDate}' AND '${dateRange.endDate}'`;
+
+    const resultsAggregator = {};
+    try {
+        const report = AdsApp.report(query);
+        for (const row of report.rows()) {
+            const productType = row['segments.product_type_l1'] || '(Not set)';
+            const conversionValue = row['metrics.all_conversions_value'] || 0;
+
+            if (!resultsAggregator[productType]) {
+                resultsAggregator[productType] = 0;
+            }
+            resultsAggregator[productType] += conversionValue;
+        }
+    } catch (e) {
+        Logger.log(`Could not fetch or process top product type data. Error: ${e}`);
+        return [];
+    }
+
+    const aggregatedArray = Object.keys(resultsAggregator).map(key => {
+        return { name: key, conversionValue: resultsAggregator[key] };
+    });
+
+    aggregatedArray.sort((a, b) => b.conversionValue - a.conversionValue);
+
+    return aggregatedArray.slice(0, 5);
+}
+
+/**
+ * --- ADDED ---
+ * Fetches and aggregates the top selling brands. This function manually
+ * aggregates results to avoid API limitations with sorting and grouping.
+ */
+function getTopSellingBrands(dateRange) {
+    const query = `
+      SELECT segments.product_brand, metrics.all_conversions_value
+      FROM shopping_performance_view
+      WHERE segments.date BETWEEN '${dateRange.startDate}' AND '${dateRange.endDate}'`;
+
+    const resultsAggregator = {};
+    try {
+        const report = AdsApp.report(query);
+        for (const row of report.rows()) {
+            const brand = row['segments.product_brand'] || '(Not set)';
+            const conversionValue = row['metrics.all_conversions_value'] || 0;
+
+            if (!resultsAggregator[brand]) {
+                resultsAggregator[brand] = 0;
+            }
+            resultsAggregator[brand] += conversionValue;
+        }
+    } catch (e) {
+        Logger.log(`Could not fetch or process top brand data. Error: ${e}`);
+        return [];
+    }
+
+    const aggregatedArray = Object.keys(resultsAggregator).map(key => {
+        return { name: key, conversionValue: resultsAggregator[key] };
+    });
+
+    aggregatedArray.sort((a, b) => b.conversionValue - a.conversionValue);
+
+    return aggregatedArray.slice(0, 5);
+}
+
+
+/**
+ * Writes the aggregated summary data to a sheet.
+ */
+function writeSummaryToSheet(spreadsheet, bfcmTotals, comparisonTotals, bfcmDateRange, comparisonDateRange) {
+    const sheet = getSheet(spreadsheet, SUMMARY_SHEET_NAME);
+    sheet.clear();
+
+    const change = (current, previous) => previous > 0 ? (current - previous) / previous : 0;
+
+    const headers = [
+        'KPI',
+        `BFCM Period (${bfcmDateRange.startDate} - ${bfcmDateRange.endDate})`,
+        `Comparison Period (${comparisonDateRange.startDate} - ${comparisonDateRange.endDate})`,
+        '% Change'
+    ];
+    sheet.getRange('A1:D1').setValues([headers]).setFontWeight('bold');
+
+    const data = [
+      ['CTR', bfcmTotals.ctr, comparisonTotals.ctr, change(bfcmTotals.ctr, comparisonTotals.ctr)],
+      ['Conversion Rate', bfcmTotals.conversionRate, comparisonTotals.conversionRate, change(bfcmTotals.conversionRate, comparisonTotals.conversionRate)],
+      ['Conversion Value', bfcmTotals.conversionValue, comparisonTotals.conversionValue, change(bfcmTotals.conversionValue, comparisonTotals.conversionValue)],
+      ['Conv. value / cost (ROAS)', bfcmTotals.roas, comparisonTotals.roas, change(bfcmTotals.roas, comparisonTotals.roas)],
+      ['Cost', bfcmTotals.cost, comparisonTotals.cost, change(bfcmTotals.cost, comparisonTotals.cost)]
+    ];
+
+    sheet.getRange(2, 1, data.length, data[0].length).setValues(data);
+
+    sheet.getRange('B2:D3').setNumberFormat('0.00%');
+    sheet.getRange('B4:C4').setNumberFormat('$#,##0.00');
+    sheet.getRange('D4').setNumberFormat('0.00%');
+    sheet.getRange('B5:C5').setNumberFormat('0.00');
+    sheet.getRange('D5').setNumberFormat('0.00%');
+    sheet.getRange('B6:C6').setNumberFormat('$#,##0.00');
+    sheet.getRange('D6').setNumberFormat('0.00%');
+    sheet.autoResizeColumns(1, 4);
+}
+
+/**
+ * Writes the daily breakdown data to a separate sheet.
+ */
+function writeDailyBreakdownToSheet(spreadsheet, dailyData) {
+    const sheet = getSheet(spreadsheet, DAILY_SHEET_NAME);
+    sheet.clear();
+
+    const headers = ['Date', 'CTR', 'Conversion Rate', 'Conversion Value', 'ROAS', 'Cost'];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+
+    if (dailyData.length > 0) {
+      const data = dailyData.map(d => [d.date, d.ctr, d.conversionRate, d.conversionValue, d.roas, d.cost]);
+      sheet.getRange(2, 1, data.length, data[0].length).setValues(data);
+      sheet.getRange('B2:C' + (data.length + 1)).setNumberFormat('0.00%');
+      sheet.getRange('D2:D' + (data.length + 1)).setNumberFormat('$#,##0.00');
+      sheet.getRange('E2:E' + (data.length + 1)).setNumberFormat('0.00');
+      sheet.getRange('F2:F' + (data.length + 1)).setNumberFormat('$#,##0.00');
+    }
+    sheet.autoResizeColumns(1, 6);
+}
+
+/**
+ * Writes the top selling products to a separate sheet.
+ */
+function writeProductsToSheet(spreadsheet, topProducts) {
+    const sheet = getSheet(spreadsheet, PRODUCT_SHEET_NAME);
+    sheet.clear();
+
+    const headers = [['Product Item ID', 'Conversion Value']];
+    sheet.getRange(1,1,1,2).setValues(headers).setFontWeight('bold');
+
+    if (topProducts.length > 0) {
+      const productData = topProducts.map(p => [p.itemId, p.conversionValue]);
+      sheet.getRange(2,1, productData.length, productData[0].length).setValues(productData);
+      sheet.getRange('B2:B' + (productData.length + 1)).setNumberFormat('$#,##0.00');
+    }
+    sheet.autoResizeColumns(1, 2);
+}
+
+/**
+ * Writes the top selling product types to a separate sheet.
+ */
+function writeProductTypesToSheet(spreadsheet, topProductTypes) {
+    const sheet = getSheet(spreadsheet, PRODUCT_TYPE_SHEET_NAME);
+    sheet.clear();
+    const headers = [['Product Type', 'Conversion Value']];
+    sheet.getRange(1,1,1,2).setValues(headers).setFontWeight('bold');
+
+    if (topProductTypes && topProductTypes.length > 0) {
+      const formattedData = topProductTypes.map(d => [d.name, d.conversionValue]);
+      sheet.getRange(2,1, formattedData.length, formattedData[0].length).setValues(formattedData);
+      sheet.getRange('B2:B' + (formattedData.length + 1)).setNumberFormat('$#,##0.00');
+    } else {
+        sheet.getRange('A2').setValue('No product type data found.');
+    }
+    sheet.autoResizeColumns(1, 2);
+}
+
+/**
+ * --- ADDED ---
+ * Writes the top selling brands to a separate sheet.
+ */
+function writeBrandsToSheet(spreadsheet, topBrands) {
+    const sheet = getSheet(spreadsheet, BRAND_SHEET_NAME);
+    sheet.clear();
+    const headers = [['Brand', 'Conversion Value']];
+    sheet.getRange(1,1,1,2).setValues(headers).setFontWeight('bold');
+
+    if (topBrands && topBrands.length > 0) {
+      const formattedData = topBrands.map(d => [d.name, d.conversionValue]);
+      sheet.getRange(2,1, formattedData.length, formattedData[0].length).setValues(formattedData);
+      sheet.getRange('B2:B' + (formattedData.length + 1)).setNumberFormat('$#,##0.00');
+    } else {
+        sheet.getRange('A2').setValue('No brand data found.');
+    }
+    sheet.autoResizeColumns(1, 2);
+}
+
+
+// --- UTILITY FUNCTIONS ---
+
+function getDateRange(startDate, endDate) {
+  return { startDate: startDate, endDate: endDate };
+}
+
+function getComparisonDateRange(dateRange) {
+  const start = new Date(dateRange.startDate + 'T00:00:00');
+  const duration = (new Date(dateRange.endDate + 'T00:00:00') - start) / (1000 * 60 * 60 * 24) + 1;
+  const comparisonStart = new Date(start.getTime() - duration * 1000 * 60 * 60 * 24);
+  const comparisonEnd = new Date(start.getTime() - 1 * 1000 * 60 * 60 * 24);
+
+  return {
+    startDate: comparisonStart.toISOString().slice(0, 10),
+    endDate: comparisonEnd.toISOString().slice(0, 10)
+  };
+}
+
+function validateAndGetSpreadsheet(spreadsheetUrl) {
+  if (spreadsheetUrl === 'YOUR_SPREADSHEET_URL' || !spreadsheetUrl) {
+    throw new Error('Please set the SPREADSHEET_URL variable in the script.');
+  }
+  try {
+    return SpreadsheetApp.openByUrl(spreadsheetUrl);
+  } catch (e) {
+    throw new Error(`Invalid spreadsheet URL: ${spreadsheetUrl}. Error: ${e}`);
+  }
+}
+
+function getSheet(spreadsheet, sheetName) {
+    return spreadsheet.getSheetByName(sheetName) || spreadsheet.insertSheet(sheetName);
+}

@@ -1,0 +1,404 @@
+//
+// ----------------------------------
+// ---- CONFIGURATION SETTINGS ----
+// ----------------------------------
+//
+
+// 1. Email Settings
+var EMAIL_RECIPIENTS = 'YOUR_EMAIL_HERE'; 
+
+// 2. Google Sheet Settings
+var SPREADSHEET_URL = 'YOUR_SPREADSHEET_URL_HERE'; 
+var REPORT_SHEET_NAME = 'Campaign Performance Report';
+var SUMMARY_SHEET_NAME = 'Spend Summary';
+var RECOMMENDATION_SHEET_NAME = 'Budget Recommendations'; // --- NEW: Sheet for budget suggestions ---
+
+// 3. Campaign Identification Settings
+var PMAX_IDENTIFIER               = ['Pmax']; 
+var GENERAL_CAMPAIGN_IDENTIFIERS  = ['Pmax_General', 'PmaxFeed_General']; 
+var EXCLUDED_CAMPAIGN_IDENTIFIERS = ['Zombies', 'Suppression', 'Suppressed']; 
+
+// 4. Time Frame Settings -- YESTERDAY , LAST_7_DAYS , LAST_30_DAYS
+var DATE_RANGE = 'LAST_7_DAYS'; 
+
+// 5. --- NEW: Budget Recommendation Settings ---
+var CONVERSION_VALUE_CHANGE_THRESHOLD = 0.15; // 15% change (up or down)
+var BUDGET_CHANGE_PERCENTAGE          = 0.10; // 10% budget change recommendation
+
+//
+// ----------------------------------
+// ----  END OF CONFIGURATION  ----
+// ----------------------------------
+//
+
+
+/**
+ * Main function that runs the script.
+ */
+function main() {
+  Logger.log('Starting Campaign Spend Check script V6 with Budget Recommendations...');
+  
+  // --- UPDATED: Fetch data for both current and previous periods ---
+  var currentPeriodData = getCampaignPerformanceData(DATE_RANGE, false);
+  if (!currentPeriodData) {
+    Logger.log('Could not retrieve current period campaign data. Aborting script.');
+    return;
+  }
+  
+  var previousPeriodDateRange = getPreviousPeriodDateRange(DATE_RANGE);
+  var previousPeriodData = getCampaignPerformanceData(previousPeriodDateRange, true);
+  
+  // Create a lookup map for previous period data for easy comparison
+  var previousPeriodMap = {};
+  for (var i = 0; i < previousPeriodData.length; i++) {
+    previousPeriodMap[previousPeriodData[i].name] = previousPeriodData[i];
+  }
+  
+  var pmaxGeneralSpend = 0;
+  var maxPerformancePmaxSpend = 0;
+  var maxPerformancePmaxCampaignName = 'N/A';
+  
+  var totalAccountCost = 0;
+  var reportSheetRows = [];
+  var recommendations = []; // --- NEW: Array to hold our budget recommendations ---
+
+  for (var i = 0; i < currentPeriodData.length; i++) {
+    var campaign = currentPeriodData[i];
+    var previousCampaign = previousPeriodMap[campaign.name] || {}; // Get previous data if it exists
+
+    totalAccountCost += campaign.cost;
+
+    var isPmax     = doesCampaignMatchIdentifiers(campaign.name, PMAX_IDENTIFIER);
+    var isGeneral  = doesCampaignMatchIdentifiers(campaign.name, GENERAL_CAMPAIGN_IDENTIFIERS);
+    var isExcluded = doesCampaignMatchIdentifiers(campaign.name, EXCLUDED_CAMPAIGN_IDENTIFIERS);
+    
+    if (isPmax) {
+      if (isGeneral) {
+        pmaxGeneralSpend += campaign.cost;
+      } else if (!isExcluded) {
+        if (campaign.cost > maxPerformancePmaxSpend) {
+          maxPerformancePmaxSpend = campaign.cost;
+          maxPerformancePmaxCampaignName = campaign.name;
+        }
+      }
+    }
+    
+    // --- NEW: Budget Recommendation Logic ---
+    var isLimitedByBudget = campaign.budgetLostImpressionShare > 0;
+    var currentConvValue = campaign.conversionsValue;
+    var previousConvValue = previousCampaign.conversionsValue || 0; // Default to 0 if no previous data
+    
+    var recommendation = 'No Change';
+    var budgetChangeAmount = 0;
+    var convValueChange = 0;
+
+    if (previousConvValue > 0) {
+      convValueChange = (currentConvValue - previousConvValue) / previousConvValue;
+    } else if (currentConvValue > 0) {
+      convValueChange = 1; // Handled as 100% increase if previous was 0 and current is positive
+    }
+    
+    var dailyBudget = campaign.dailyBudget; // Daily budget already in account currency.
+
+    if (isLimitedByBudget && convValueChange > CONVERSION_VALUE_CHANGE_THRESHOLD) {
+      budgetChangeAmount = dailyBudget * BUDGET_CHANGE_PERCENTAGE;
+      recommendation = 'Increase budget by ' + (BUDGET_CHANGE_PERCENTAGE * 100).toFixed(0) + '%';
+    } else if (convValueChange < -CONVERSION_VALUE_CHANGE_THRESHOLD) {
+      budgetChangeAmount = - (dailyBudget * BUDGET_CHANGE_PERCENTAGE);
+      recommendation = 'Decrease budget by ' + (BUDGET_CHANGE_PERCENTAGE * 100).toFixed(0) + '%';
+    }
+    
+    recommendations.push([
+        campaign.name, dailyBudget, (isLimitedByBudget ? 'Yes' : 'No'), currentConvValue, previousConvValue,
+        convValueChange, recommendation, budgetChangeAmount
+    ]);
+    
+    reportSheetRows.push([
+      campaign.name, campaign.status, campaign.cost, campaign.impressions,
+      campaign.clicks, campaign.ctr, campaign.conversions, campaign.cpa, campaign.roas
+    ]);
+  }
+  
+  if (pmaxGeneralSpend > maxPerformancePmaxSpend && pmaxGeneralSpend > 0) {
+    Logger.log('ALERT: General PMax total spend (' + pmaxGeneralSpend.toFixed(2) + ') has exceeded the spend of the top performance PMax campaign ("' + maxPerformancePmaxCampaignName + '", ' + maxPerformancePmaxSpend.toFixed(2) + ').');
+    sendEmailAlert(pmaxGeneralSpend, maxPerformancePmaxSpend, maxPerformancePmaxCampaignName);
+  } else {
+    Logger.log('All clear. General PMax spend has not exceeded the top performance PMax campaign.');
+  }
+
+  Logger.log('Now updating the Google Sheets...');
+  populateReportSheet(reportSheetRows);
+  populateSummarySheet(currentPeriodData, totalAccountCost);
+  populateRecommendationSheet(recommendations); // --- NEW: Call the new function ---
+
+  Logger.log('Script finished.');
+}
+
+
+/**
+ * --- NEW FUNCTION ---
+ * Creates a formatted date string for a number of days ago.
+ */
+function getPastDate(daysAgo, format) {
+    var date = new Date();
+    date.setDate(date.getDate() - daysAgo);
+    return Utilities.formatDate(date, AdsApp.currentAccount().getTimeZone(), format);
+}
+
+/**
+ * --- CORRECTED FUNCTION V4 ---
+ * Calculates the date range for the period immediately preceding the main DATE_RANGE.
+ * This version now formats the date as YYYY-MM-DD for a robust query.
+ */
+function getPreviousPeriodDateRange(dateRange) {
+    var today = new Date();
+    var timeZone = AdsApp.currentAccount().getTimeZone();
+
+    function formatDate(date) {
+        // Returns date in 'YYYY-MM-DD' format.
+        return Utilities.formatDate(date, timeZone, 'yyyy-MM-dd');
+    }
+
+    var endDateOffset, startDateOffset;
+
+    if (dateRange === 'YESTERDAY') {
+        // Previous period is the day before yesterday.
+        startDateOffset = 2;
+        endDateOffset = 2;
+    } else if (dateRange === 'LAST_7_DAYS') {
+        // Previous period is [today-14 to today-8].
+        startDateOffset = 14;
+        endDateOffset = 8;
+    } else if (dateRange === 'LAST_30_DAYS') {
+        // Previous period is [today-60 to today-31].
+        startDateOffset = 60;
+        endDateOffset = 31;
+    } else {
+        // Cannot reliably calculate previous period for a custom date range.
+        return dateRange;
+    }
+
+    var startDate = new Date();
+    startDate.setDate(today.getDate() - startDateOffset);
+
+    var endDate = new Date();
+    endDate.setDate(today.getDate() - endDateOffset);
+
+    var finalRange = formatDate(startDate) + ',' + formatDate(endDate);
+    
+    Logger.log('Calculated previous date range for comparison: ' + finalRange);
+    return finalRange;
+}
+
+/**
+ * --- UPDATED FUNCTION V3 ---
+ * Fetches campaign performance data.
+ * This version now correctly handles both predefined date ranges (e.g., LAST_7_DAYS) and custom date ranges
+ * by constructing the appropriate 'WHERE' clause, which resolves the 'BAD_VALUE' error.
+ */
+function getCampaignPerformanceData(dateRange, isPreviousPeriod) {
+    var budgetFields = isPreviousPeriod ? "" : ", campaign_budget.amount_micros, metrics.search_budget_lost_impression_share ";
+
+    // --- FIX: Build the date clause conditionally ---
+    var dateClause = "";
+    if (dateRange.indexOf(',') !== -1) {
+        // This is a custom date range from getPreviousPeriodDateRange, e.g., '2025-08-07,2025-08-13'
+        var dates = dateRange.split(',');
+        var startDate = dates[0];
+        var endDate = dates[1];
+        // Use a standard BETWEEN...AND clause for custom dates.
+        dateClause = "segments.date BETWEEN '" + startDate + "' AND '" + endDate + "'";
+    } else {
+        // This is a predefined range, e.g., 'LAST_7_DAYS'
+        dateClause = "segments.date DURING " + dateRange;
+    }
+
+    var query = "SELECT campaign.name, campaign.status, metrics.cost_micros, metrics.impressions, " +
+      "metrics.clicks, metrics.ctr, metrics.conversions, metrics.cost_per_conversion, metrics.conversions_value " +
+      budgetFields + 
+      "FROM campaign WHERE " + dateClause + // Use the correctly built date clause
+      " AND campaign.status != 'REMOVED'";
+  
+    try {
+        var report = AdsApp.report(query);
+        var rows = report.rows();
+        var campaignData = [];
+        while (rows.hasNext()) {
+            var row = rows.next();
+            var costMicros = row['metrics.cost_micros'] || 0;
+            var cost = costMicros / 1000000;
+            var conversionsValue = row['metrics.conversions_value'] || 0;
+            
+            var data = {
+                name: row['campaign.name'], status: row['campaign.status'], cost: cost, impressions: row['metrics.impressions'],
+                clicks: row['metrics.clicks'], ctr: row['metrics.ctr'], conversions: row['metrics.conversions'],
+                cpa: row['metrics.cost_per_conversion'], roas: (cost > 0) ? (conversionsValue / cost) : 0,
+                conversionsValue: conversionsValue,
+                dailyBudget: 0,
+                budgetLostImpressionShare: 0
+            };
+            
+            if (!isPreviousPeriod) {
+                data.dailyBudget = (row['campaign_budget.amount_micros'] || 0) / 1000000;
+                data.budgetLostImpressionShare = row['metrics.search_budget_lost_impression_share'] || 0;
+            }
+            
+            campaignData.push(data);
+        }
+        return campaignData;
+    } catch (e) {
+        Logger.log('Failed to run report with error: ' + e);
+        if (EMAIL_RECIPIENTS) {
+            MailApp.sendEmail(EMAIL_RECIPIENTS, 'Google Ads Script Failed', 'The Campaign Spend Check script failed to execute. Error: ' + e);
+        }
+        return null;
+    }
+}
+/**
+ * --- UPDATED FUNCTION ---
+ * Populates the Google Sheet with budget reallocation recommendations.
+ * Now sorts the recommendations by Conversion Value in descending order.
+ */
+function populateRecommendationSheet(data) {
+    if (!SPREADSHEET_URL || SPREADSHEET_URL === 'YOUR_SPREADSHEET_URL_HERE') {
+        Logger.log('Warning: SPREADSHEET_URL is not set. Cannot write to recommendation sheet.');
+        return;
+    }
+    try {
+        var spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+        var sheet = spreadsheet.getSheetByName(RECOMMENDATION_SHEET_NAME);
+        if (!sheet) { sheet = spreadsheet.insertSheet(RECOMMENDATION_SHEET_NAME); }
+        sheet.clear();
+        
+        // --- NEW: Sort the data by Conversion Value (descending) before writing ---
+        // The current conversion value is the 4th element in each sub-array (index 3).
+        data.sort(function(a, b) {
+            return b[3] - a[3]; 
+        });
+
+        var headers = [
+            'Campaign Name', 'Current Daily Budget', 'Limited by Budget?', 
+            'Conv. Value (Current)', 'Conv. Value (Previous)', '% Change',
+            'Recommendation', 'Suggested Daily Budget Change ($)'
+        ];
+
+        sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+        if (data.length > 0) {
+            sheet.getRange(2, 1, data.length, data[0].length).setValues(data);
+            // Formatting
+            sheet.getRange(2, 2, data.length, 1).setNumberFormat('$#,##0.00'); // Daily Budget
+            sheet.getRange(2, 4, data.length, 2).setNumberFormat('$#,##0.00'); // Conv. Values
+            sheet.getRange(2, 6, data.length, 1).setNumberFormat('0.00%');   // % Change
+            sheet.getRange(2, 8, data.length, 1).setNumberFormat('$#,##0.00'); // Suggested Change
+        }
+        for (var i = 1; i <= headers.length; i++) {
+            sheet.autoResizeColumn(i);
+        }
+        Logger.log('Successfully populated sorted budget recommendation sheet.');
+    } catch (e) {
+        Logger.log('Error writing to recommendation spreadsheet: ' + e.toString());
+    }
+}
+
+
+//
+// -- NO CHANGES TO THE FUNCTIONS BELOW THIS LINE --
+//
+
+/**
+ * -- HELPER FUNCTION --
+ * Checks if a campaign name contains any of the provided identifiers, case-insensitively.
+ */
+function doesCampaignMatchIdentifiers(campaignName, identifiers) {
+    var lowerCaseCampaignName = campaignName.toLowerCase();
+    for (var i = 0; i < identifiers.length; i++) {
+        if (lowerCaseCampaignName.indexOf(identifiers[i].toLowerCase()) > -1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * --- UPDATED: Sends a more specific email alert for PMax comparison ---
+ */
+function sendEmailAlert(generalCost, comparisonSpend, comparisonName) {
+  if (!EMAIL_RECIPIENTS) {
+    Logger.log('Warning: EMAIL_RECIPIENTS is not set. Cannot send email alert.');
+    return;
+  }
+  var subject = 'Google Ads Alert: General PMax Spend Exceeds a Performance PMax Campaign';
+  var body = 'Hello,\n\n' +
+    'This is an automated alert from your Google Ads account.\n\n' +
+    'For the period "' + DATE_RANGE + '", the total spend of your General PMax campaigns has exceeded the spend of your highest-spending individual performance PMax campaign.\n\n' +
+    ' - Total General PMax Campaigns Spend: $' + generalCost.toFixed(2) + '\n' +
+    ' - Top Performance PMax Campaign ("' + comparisonName + '") Spend: $' + comparisonSpend.toFixed(2) + '\n\n' +
+    'A full performance report and spend summary for ALL campaigns have been generated in your Google Sheet:\n' +
+    SPREADSHEET_URL + '\n\n' +
+    'Please review your campaign budgets and performance.\n\n' +
+    'Thank you';
+  MailApp.sendEmail(EMAIL_RECIPIENTS, subject, body);
+  Logger.log('Email alert sent to ' + EMAIL_RECIPIENTS);
+}
+
+/**
+ * Populates a summary Google Spreadsheet with each campaign's % of total spend.
+ */
+function populateSummarySheet(campaignData, totalCost) {
+    if (!SPREADSHEET_URL || SPREADSHEET_URL === 'YOUR_SPREADSHEET_URL_HERE') {
+        Logger.log('Warning: SPREADSHEET_URL is not set. Cannot write to summary sheet.');
+        return;
+    }
+    try {
+        var spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+        var sheet = spreadsheet.getSheetByName(SUMMARY_SHEET_NAME);
+        if (!sheet) { sheet = spreadsheet.insertSheet(SUMMARY_SHEET_NAME); }
+        sheet.clear();
+        var summaryRows = [];
+        for (var i = 0; i < campaignData.length; i++) {
+            var campaign = campaignData[i];
+            var spendPercentage = (totalCost > 0) ? (campaign.cost / totalCost) : 0;
+            summaryRows.push([campaign.name, campaign.cost, spendPercentage]);
+        }
+        summaryRows.sort(function(a, b) { return b[1] - a[1]; });
+        var headers = ['Campaign Name', 'Cost', '% of Total Spend'];
+        sheet.getRange(1, 1, 1, 2).setValues([['Total Account Spend:', totalCost.toFixed(2)]]).setFontWeight('bold');
+        sheet.getRange(3, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+        if (summaryRows.length > 0) {
+            sheet.getRange(4, 1, summaryRows.length, summaryRows[0].length).setValues(summaryRows);
+            sheet.getRange(4, 2, summaryRows.length, 1).setNumberFormat('$#,##0.00');
+            sheet.getRange(4, 3, summaryRows.length, 1).setNumberFormat('0.00%');
+        }
+        sheet.autoResizeColumn(1);
+        Logger.log('Successfully populated summary sheet.');
+    } catch(e) {
+        Logger.log('Error writing to summary spreadsheet: ' + e.toString());
+    }
+}
+
+/**
+ * Populates the main report Google Spreadsheet with campaign data.
+ */
+function populateReportSheet(data) {
+  if (!SPREADSHEET_URL || SPREADSHEET_URL === 'YOUR_SPREADSHEET_URL_HERE') {
+    Logger.log('Warning: SPREADSHEET_URL is not set. Cannot write to report sheet.');
+    return;
+  }
+  try {
+    var spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+    var sheet = spreadsheet.getSheetByName(REPORT_SHEET_NAME);
+    if (!sheet) { sheet = spreadsheet.insertSheet(REPORT_SHEET_NAME); }
+    sheet.clear();
+    var headers = [ 'Campaign Name', 'Status', 'Cost', 'Impressions', 'Clicks', 'CTR', 'Conversions', 'CPA', 'ROAS' ];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    if (data.length > 0) {
+      sheet.getRange(2, 1, data.length, data[0].length).setValues(data);
+      sheet.getRange(2, 3, data.length, 1).setNumberFormat('$#,##0.00');
+      sheet.getRange(2, 8, data.length, 1).setNumberFormat('$#,##0.00');
+    }
+    for(var i=1; i <= headers.length; i++) { sheet.autoResizeColumn(i); }
+    Logger.log('Successfully populated report sheet: ' + SPREADSHEET_URL);
+  } catch(e) {
+    Logger.log('Error writing to report spreadsheet: ' + e.toString());
+  }
+}

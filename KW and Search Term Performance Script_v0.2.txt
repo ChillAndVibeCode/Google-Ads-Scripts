@@ -1,0 +1,187 @@
+// ------------------- Configuration -------------------
+var SPREADSHEET_URL = "YOUR_SPREADSHEET_URL"; // << Replace with your Google Sheet URL
+var DATE_RANGE = "LAST_30_DAYS"; // Options: "LAST_30_DAYS", "LAST_60_DAYS", "LAST_90_DAYS"
+var MIN_CLICKS_FOR_PMAX_CATEGORY = 1; // << To prevent timeouts, only process PMax categories with at least this many clicks.
+// -----------------------------------------------------
+
+function main() {
+    var spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+    var accountName = AdsApp.currentAccount().getName();
+
+    // --- Process Standard Campaigns (Keywords and Search Terms) ---
+    var keywordReport = getReportAsArray("KEYWORDS_PERFORMANCE_REPORT", DATE_RANGE);
+    var keywordSpend = keywordReport.map(function(r) { return parseFloat(r.Cost); });
+    var keywordSpendThreshold = calculatePercentile(keywordSpend, 30);
+    var negativeKeywords = [], keywordData = [];
+
+    keywordReport.forEach(function(row) {
+        var cost = parseFloat(row.Cost);
+        var conversions = parseFloat(row.Conversions);
+        var roas = cost > 0 ? parseFloat(row.ConversionValue) / cost : 0;
+        keywordData.push([row.CampaignName, row.AdGroupName, row.Criteria, row.Impressions, row.Clicks, cost, conversions, row.ConversionValue, roas]);
+        if (cost > keywordSpendThreshold && (conversions === 0 || roas < 1)) {
+            negativeKeywords.push([row.CampaignName, row.AdGroupName, row.Criteria, cost, conversions, roas]);
+        }
+    });
+
+    var searchTermReport = getReportAsArray("SEARCH_QUERY_PERFORMANCE_REPORT", DATE_RANGE);
+    var searchTermSpend = searchTermReport.map(function(r) { return parseFloat(r.Cost); });
+    var searchThreshold = calculatePercentile(searchTermSpend, 30);
+    var negativeSearchTerms = [], positiveSearchTerms = [], searchTermsForSheet = [];
+
+    searchTermReport.forEach(function(row) {
+        var cost = parseFloat(row.Cost);
+        var conversions = parseFloat(row.Conversions);
+        var roas = cost > 0 ? parseFloat(row.ConversionValue) / cost : 0;
+        searchTermsForSheet.push([row.CampaignName, row.AdGroupName, row.Query, row.Impressions, row.Clicks, cost, conversions, row.ConversionValue, roas]);
+        if (cost > searchThreshold && (conversions === 0 || roas < 1)) {
+            negativeSearchTerms.push([row.CampaignName, row.AdGroupName, row.Query, cost, conversions, roas]);
+        }
+        if (roas > 1) {
+            positiveSearchTerms.push([row.CampaignName, row.AdGroupName, row.Query, cost, conversions, roas]);
+        }
+    });
+
+    // --- Process Performance Max using the CORRECT multi-step logic ---
+    var pmaxSearchData = getPMaxSearchTerms(DATE_RANGE, MIN_CLICKS_FOR_PMAX_CATEGORY);
+    var pmaxClicks = pmaxSearchData.map(function(r) { return r.Clicks; });
+    var pmaxClickThreshold = calculatePercentile(pmaxClicks, 70);
+    var negativePMaxTerms = [], positivePMaxTerms = [], pmaxTermsForSheet = [];
+
+    pmaxSearchData.forEach(function(row) {
+        pmaxTermsForSheet.push([row.CampaignName, row.Query, row.Impressions, row.Clicks, row.Conversions, row.ConversionValue]);
+        if (row.Clicks > pmaxClickThreshold && row.Conversions < 1) {
+            negativePMaxTerms.push([row.CampaignName, row.Query, row.Clicks, row.Conversions]);
+        }
+        if (row.Conversions >= 1) {
+            positivePMaxTerms.push([row.CampaignName, row.Query, row.Clicks, row.Conversions, row.ConversionValue]);
+        }
+    });
+
+    // --- Write all data to sheets ---
+    createSummarySheet(spreadsheet, negativeKeywords, negativeSearchTerms, positiveSearchTerms, negativePMaxTerms, positivePMaxTerms);
+    writeToSheet(spreadsheet, accountName + " - Keyword Performance", keywordData, ["Campaign", "Ad Group", "Keyword", "Impressions", "Clicks", "Cost", "Conversions", "Conversion Value", "ROAS"]);
+    writeToSheet(spreadsheet, accountName + " - Search Term Performance", searchTermsForSheet, ["Campaign", "Ad Group", "Search Term", "Impressions", "Clicks", "Cost", "Conversions", "Conversion Value", "ROAS"]);
+    writeToSheet(spreadsheet, accountName + " - PMax Search Term Performance", pmaxTermsForSheet, ["Campaign", "Search Term", "Impressions", "Clicks", "Conversions", "Conversion Value"]);
+}
+
+// --- DATA FETCHING FUNCTIONS ---
+
+function getPMaxSearchTerms(dateRange, minClicks) {
+    Logger.log("Step A: Fetching significant PMax insight categories (min " + minClicks + " clicks)...");
+    var insightCategories = [];
+    var categoryQuery = `
+        SELECT campaign.id, campaign.name, campaign_search_term_insight.id
+        FROM campaign_search_term_insight
+        WHERE segments.date DURING ${dateRange}
+          AND campaign.advertising_channel_type = 'PERFORMANCE_MAX'
+          AND metrics.clicks >= ${minClicks}`;
+
+    var report = AdsApp.search(categoryQuery);
+    while(report.hasNext()) {
+        var row = report.next();
+        insightCategories.push({
+            CampaignName: row.campaign.name,
+            CampaignId: row.campaign.id,
+            CategoryId: row.campaignSearchTermInsight.id
+        });
+    }
+    Logger.log("Found " + insightCategories.length + " insight categories to process.");
+
+    var pmaxSearchTerms = [];
+    Logger.log("Step B: Looping through categories to get search terms...");
+    insightCategories.forEach(function(category) {
+        // ----vv---- THIS IS THE CRITICAL FIX ----vv----
+        // The WHERE clause now correctly includes BOTH the category ID and the campaign ID, as required by the API.
+        var searchTermQuery = `
+            SELECT segments.search_term, segments.search_subcategory, metrics.clicks,
+                   metrics.impressions, metrics.conversions, metrics.conversions_value
+            FROM campaign_search_term_insight 
+            WHERE segments.date DURING ${dateRange}
+              AND campaign_search_term_insight.id = "${category.CategoryId}"
+              AND campaign.id = ${category.CampaignId}`;
+
+        var searchTermReport = AdsApp.search(searchTermQuery);
+        while (searchTermReport.hasNext()) {
+            var termRow = searchTermReport.next();
+            pmaxSearchTerms.push({
+                CampaignName: category.CampaignName,
+                Query: termRow.segments.searchTerm,
+                Clicks: termRow.metrics.clicks,
+                Impressions: termRow.metrics.impressions,
+                Conversions: termRow.metrics.conversions,
+                ConversionValue: termRow.metrics.conversionsValue
+            });
+        }
+    });
+    Logger.log("Finished. Found " + pmaxSearchTerms.length + " total PMax search terms.");
+    return pmaxSearchTerms;
+}
+
+
+// Fetches data for regular Search and Keyword reports.
+function getReportAsArray(reportType, dateRange) {
+    var data = [];
+    var fields, query;
+    if (reportType === 'KEYWORDS_PERFORMANCE_REPORT') {
+        fields = "CampaignName, AdGroupName, Criteria, Impressions, Clicks, Cost, Conversions, ConversionValue";
+        query = `SELECT ${fields} FROM ${reportType} WHERE CampaignStatus = 'ENABLED' AND AdGroupStatus = 'ENABLED' AND Status = 'ENABLED' DURING ${dateRange}`;
+    } else {
+        fields = "CampaignName, AdGroupName, Query, Impressions, Clicks, Cost, Conversions, ConversionValue";
+        query = `SELECT ${fields} FROM ${reportType} WHERE CampaignStatus = 'ENABLED' AND AdGroupStatus = 'ENABLED' DURING ${dateRange}`;
+    }
+    var report = AdsApp.report(query);
+    var rows = report.rows();
+    while (rows.hasNext()) { data.push(rows.next()); }
+    Logger.log(`Found ${data.length} rows for the ${reportType} report.`);
+    return data;
+}
+
+// --- HELPER FUNCTIONS ---
+
+function calculatePercentile(data, percentile) {
+    if (data.length === 0) return 0;
+    data.sort(function(a, b) { return a - b; });
+    var index = Math.floor((percentile / 100) * data.length);
+    if(index >= data.length) return data[data.length - 1] || 0;
+    return data[index];
+}
+
+function writeToSheet(spreadsheet, sheetName, data, headers) {
+    var sheet = spreadsheet.getSheetByName(sheetName);
+    if (sheet) spreadsheet.deleteSheet(sheet);
+    sheet = spreadsheet.insertSheet(sheetName);
+    sheet.appendRow(headers);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+    if (data.length > 0) {
+        sheet.getRange(2, 1, data.length, data[0].length).setValues(data);
+        sheet.autoResizeColumns(1, headers.length);
+    }
+}
+
+function createSummarySheet(spreadsheet, negativeKeywords, negativeSearchTerms, positiveSearchTerms, negativePMaxTerms, positivePMaxTerms) {
+    var sheetName = "Summary";
+    var sheet = spreadsheet.getSheetByName(sheetName);
+    if (sheet) spreadsheet.deleteSheet(sheet);
+    sheet = spreadsheet.insertSheet(sheetName, 0);
+    var currentRow = 1;
+
+    function buildSection(title, headers, data) {
+        if (currentRow > 1) { currentRow++; }
+        sheet.getRange(currentRow, 1).setValue(title).setFontWeight("bold");
+        currentRow++;
+        sheet.getRange(currentRow, 1, 1, headers.length).setValues([headers]).setFontWeight("bold");
+        currentRow++;
+        if (data.length > 0) {
+            sheet.getRange(currentRow, 1, data.length, data[0].length).setValues(data);
+            currentRow += data.length;
+        }
+    }
+
+    buildSection("Poorly Performing Keywords (Potential Negatives)", ["Campaign", "Ad Group", "Keyword", "Cost", "Conversions", "ROAS"], negativeKeywords);
+    buildSection("Poorly Performing Search Terms (Potential Negatives)", ["Campaign", "Ad Group", "Search Term", "Cost", "Conversions", "ROAS"], negativeSearchTerms);
+    buildSection("Good Performing Search Terms (Potential Keywords to Add)", ["Campaign", "Ad Group", "Search Term", "Cost", "Conversions", "ROAS"], positiveSearchTerms);
+    buildSection("Poorly Performing PMax Search Terms (High Clicks, No Conversions)", ["Campaign", "Search Term", "Clicks", "Conversions"], negativePMaxTerms);
+    buildSection("Good Performing PMax Search Terms (Has Conversions)", ["Campaign", "Search Term", "Clicks", "Conversions", "Conv. Value"], positivePMaxTerms);
+    sheet.autoResizeColumns(1, 8);
+}

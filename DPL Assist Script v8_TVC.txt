@@ -1,0 +1,336 @@
+// --- Configuration ---
+const SPREADSHEET_URL = 'YOUR_SPREADSHEET_URL_HERE';
+const RAW_PRODUCT_DATA_SHEET_NAME_BASE = 'Product Performance Raw Data';
+const PERFORMANCE_RULES_SHEET_NAME_BASE = 'Dynamic Performance Rules - TVC';
+const TVC_PRODUCT_LIST_SHEET_NAME_BASE = 'TVC Product List';
+const CONSISTENT_PERFORMERS_SHEET_NAME = 'Consistent TVC Products';
+
+const DATE_RANGES_IN_DAYS = [30, 60, 90, 180, 365, 540];
+const CONTRIBUTION_TARGET_PERCENTAGES = [50, 75, 90];
+
+// --- Main Function ---
+function main() {
+  const now = new Date();
+  const timezone = AdsApp.currentAccount().getTimeZone();
+  const spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+  
+  const allTvcProductLists = [];
+
+  Logger.log(`Starting Product Performance Analysis Script (Top Volume Contributors).`);
+  Logger.log(`Identifying products contributing to the top ${CONTRIBUTION_TARGET_PERCENTAGES.join('%, ')}% of total conversions.`);
+
+  for (const numberOfDays of DATE_RANGES_IN_DAYS) {
+    Logger.log(`\n--- Processing for ${numberOfDays} days ---`);
+
+    const endDate = new Date(now.getTime() - 24 * 60 * 60 * 1000); // Yesterday
+    const startDate = new Date(endDate.getTime() - (numberOfDays - 1) * 24 * 60 * 60 * 1000);
+    const startDateFormatted = formatDateForGAQL(startDate, timezone);
+    const endDateFormatted = formatDateForGAQL(endDate, timezone);
+
+    Logger.log(`Current Period: ${numberOfDays} days`);
+    Logger.log(`Start Date: ${startDateFormatted}`);
+    Logger.log(`End Date: ${endDateFormatted}`);
+
+    const currentRawProductDataSheetName = `${RAW_PRODUCT_DATA_SHEET_NAME_BASE} - ${numberOfDays} Days`;
+    const currentPerformanceRulesSheetName = `${PERFORMANCE_RULES_SHEET_NAME_BASE} - ${numberOfDays} Days`;
+    const currentTVCProductListSheetName = `${TVC_PRODUCT_LIST_SHEET_NAME_BASE} - ${numberOfDays} Days`;
+
+    let productData;
+    try {
+      productData = fetchProductPerformanceData(spreadsheet, currentRawProductDataSheetName, startDateFormatted, endDateFormatted, timezone);
+    } catch (e) {
+      Logger.log(`Error fetching product data for ${numberOfDays} days: ${e.message}. Skipping this range.`);
+      console.error(`Error fetching product data for ${numberOfDays} days: ${e.message}. URL: ${SPREADSHEET_URL}.`);
+      continue;
+    }
+
+    if (!productData || productData.length === 0) {
+      Logger.log(`No product data fetched for ${numberOfDays} days. Cannot proceed with rule calculations for this range.`);
+      continue;
+    }
+
+    try {
+        // --- CORRECTED LINE ---
+        // Pass the 'numberOfDays' variable to the function.
+        calculateAndDefineRules_TopVolumeContributors(spreadsheet, currentPerformanceRulesSheetName, currentTVCProductListSheetName, productData, startDateFormatted, endDateFormatted, allTvcProductLists, numberOfDays);
+    } catch (e) {
+        Logger.log(`Error calculating rules for ${numberOfDays} days: ${e.message}. Skipping rules for this range.`);
+        console.error(`Error calculating rules for ${numberOfDays} days: ${e.message}.`);
+        continue;
+    }
+
+    Logger.log(`--- Finished processing for ${numberOfDays} days ---`);
+  }
+  
+  try {
+    processAndDisplayConsistentPerformers(spreadsheet, allTvcProductLists);
+  } catch(e) {
+    Logger.log(`Error processing consistent performers: ${e.message}`);
+    console.error(`Error processing consistent performers: ${e.message}`);
+  }
+
+  Logger.log(`\nScript execution finished for all specified date ranges for ${SPREADSHEET_URL}`);
+}
+
+// --- Helper function to format dates for GAQL ---
+function formatDateForGAQL(date, timezone) {
+  return Utilities.formatDate(date, timezone, 'yyyy-MM-dd');
+}
+
+// --- Function to Fetch Product Performance Data ---
+function fetchProductPerformanceData(spreadsheet, sheetName, startDate, endDate, timezone) {
+  Logger.log(`--- Starting Product Performance Data Fetch for sheet: ${sheetName} ---`);
+  let sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) { sheet = spreadsheet.insertSheet(sheetName); }
+  sheet.clearContents();
+  const originalHeaders = ['Item ID', 'Campaign Name', 'Ad Group Name', 'Impressions', 'Clicks', 'Cost', 'Conversions', 'Conversion Value', 'ROAS'];
+  sheet.getRange(1, 1, 1, originalHeaders.length).setValues([originalHeaders]).setFontWeight('bold');
+  
+  let query = `SELECT segments.product_item_id, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM shopping_performance_view WHERE segments.date >= '${startDate}' AND segments.date <= '${endDate}' AND metrics.impressions > 0`;
+  let fetchedRowsCollection;
+  try {
+    fetchedRowsCollection = Array.from(AdsApp.report(query).rows());
+  } catch (e) {
+    Logger.log(`Initial query failed, trying again without impression filter: ${e}`);
+    query = `SELECT segments.product_item_id, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM shopping_performance_view WHERE segments.date >= '${startDate}' AND segments.date <= '${endDate}'`;
+    try {
+      fetchedRowsCollection = Array.from(AdsApp.report(query).rows());
+    } catch (e2) {
+      Logger.log(`Second query failed, trying simplest query: ${e2}`);
+      query = `SELECT segments.product_item_id, metrics.impressions, metrics.clicks, metrics.cost_micros FROM shopping_performance_view WHERE segments.date >= '${startDate}' AND segments.date <= '${endDate}'`;
+      fetchedRowsCollection = Array.from(AdsApp.report(query).rows());
+    }
+  }
+
+  if (!fetchedRowsCollection || fetchedRowsCollection.length === 0) {
+    Logger.log('No product performance data found for the specified period.');
+    return [];
+  }
+  
+  const dataToWrite = fetchedRowsCollection.map(row => {
+    const cost = (row['metrics.cost_micros'] || 0) / 1000000;
+    const conversions = parseFloat(row['metrics.conversions'] || 0);
+    const conversionsValue = parseFloat(row['metrics.conversions_value'] || 0);
+    const roas = (cost > 0) ? (conversionsValue / cost) : 0;
+    
+    return [ row['segments.product_item_id'], 'N/A', 'N/A', parseInt(row['metrics.impressions'] || 0), parseInt(row['metrics.clicks'] || 0), parseFloat(cost.toFixed(2)), conversions, conversionsValue, parseFloat(roas.toFixed(4)) ];
+  });
+
+  if (dataToWrite.length > 0) {
+    sheet.getRange(2, 1, dataToWrite.length, originalHeaders.length).setValues(dataToWrite);
+    Logger.log(`Successfully dumped ${dataToWrite.length} rows of product performance data to ${sheetName}`);
+  }
+  return dataToWrite;
+}
+
+// --- CORRECTED LINE ---
+// Added the 'numberOfDays' parameter to the function definition.
+function calculateAndDefineRules_TopVolumeContributors(spreadsheet, rulesSheetName, tvcListSheetName, productData, reportStartDate, reportEndDate, allTvcProductLists, numberOfDays) {
+    Logger.log(`--- Starting Rule Calculation (TVC) for sheet: ${rulesSheetName} ---`);
+    let rulesSheet = spreadsheet.getSheetByName(rulesSheetName);
+    if (!rulesSheet) { rulesSheet = spreadsheet.insertSheet(rulesSheetName); }
+    rulesSheet.clearContents();
+
+    const headers = ['Model / Rule Category', 'Metric', 'Calculated Value / Info', 'Rule Definition / Description', 'Products Matching'];
+    const daysInPeriod = (new Date(reportEndDate) - new Date(reportStartDate))/(24*60*60*1000)+1;
+    rulesSheet.getRange(1, 1).setValue(`Report Dates: ${reportStartDate} to ${reportEndDate} (${daysInPeriod.toFixed(0)} Days)`).setFontWeight('bold');
+    rulesSheet.getRange(2, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    
+    const rulesData = [];
+    
+    let conversionThreshold = 3; 
+    let conservativeRoasThreshold = 1.5;
+    let balancedRoasThreshold = 3.5;
+    let aggressiveRoasThreshold = 5.0;
+
+    const productsWithCost = productData.filter(p => (p[5] || 0) > 0);
+
+    if (productsWithCost.length > 0) {
+        const totalConversionsFromCostingProducts = productsWithCost.reduce((sum, p) => sum + (p[6] || 0), 0);
+        if (totalConversionsFromCostingProducts > 0) {
+            const allContributingProducts = productsWithCost.filter(p => (p[6] || 0) > 0).map(p => ({ itemId: p[0], conversions: p[6], roas: p[8], cost: p[5], conversionValue: p[7] })).sort((a, b) => b.conversions - a.conversions);
+
+            for (const targetPercentage of CONTRIBUTION_TARGET_PERCENTAGES) {
+                const targetConversionSum = totalConversionsFromCostingProducts * (targetPercentage / 100);
+                const topContributorsList = [];
+                let cumulativeConversions = 0;
+
+                for (const prod of allContributingProducts) {
+                    if (cumulativeConversions < targetConversionSum) {
+                        topContributorsList.push(prod);
+                        cumulativeConversions += prod.conversions;
+                    } else {
+                        if (topContributorsList.length > 0 && prod.conversions === topContributorsList[topContributorsList.length - 1].conversions) { topContributorsList.push(prod); } else { break; }
+                    }
+                }
+                
+                const productCount = topContributorsList.length;
+                let highestVolume = 'N/A', medianVolume = 0, lowestVolume = 'N/A', averageVolume = 0, totalCost = 0, totalConvValue = 0, totalRoas = 0;
+
+                if (productCount > 0) {
+                    const convValues = topContributorsList.map(p => p.conversions);
+                    const roasValues = topContributorsList.map(p => p.roas);
+                    highestVolume = Math.max(...convValues);
+                    medianVolume = calculateMedian(convValues);
+                    lowestVolume = Math.min(...convValues);
+                    averageVolume = topContributorsList.reduce((sum, p) => sum + p.conversions, 0) / productCount;
+                    totalCost = topContributorsList.reduce((sum, p) => sum + p.cost, 0);
+                    totalConvValue = topContributorsList.reduce((sum, p) => sum + p.conversionValue, 0);
+                    totalRoas = totalCost > 0 ? totalConvValue / totalCost : 0;
+                    
+                    if (targetPercentage === 75) {
+                        conversionThreshold = calculatePercentile(convValues, 30);
+                        conservativeRoasThreshold = calculatePercentile(roasValues, 30);
+                        balancedRoasThreshold = calculateMedian(roasValues);
+                        aggressiveRoasThreshold = calculatePercentile(roasValues, 75);
+
+                        if (topContributorsList.length > 0) {
+                            const currentTvcProductIds = new Set(topContributorsList.map(p => p.itemId));
+                            allTvcProductLists.push(currentTvcProductIds);
+                            Logger.log(`Stored ${currentTvcProductIds.size} TVC product IDs for the ${numberOfDays} day period.`);
+                        }
+
+                        let tvcSheet = spreadsheet.getSheetByName(tvcListSheetName);
+                        if(tvcSheet) { spreadsheet.deleteSheet(tvcSheet); }
+                        tvcSheet = spreadsheet.insertSheet(tvcListSheetName);
+                        const tvcHeaders = ['Item ID', 'Conversions', 'ROAS', 'Cost', 'Conversion Value'];
+                        tvcSheet.getRange(1, 1, 1, tvcHeaders.length).setValues([tvcHeaders]).setFontWeight('bold');
+                        const tvcDataToWrite = topContributorsList.map(p => [p.itemId, p.conversions.toFixed(2), p.roas.toFixed(2), p.cost.toFixed(2), p.conversionValue.toFixed(2)]);
+                        tvcSheet.getRange(2, 1, tvcDataToWrite.length, tvcDataToWrite[0].length).setValues(tvcDataToWrite);
+                        Logger.log(`Created dedicated sheet with ${tvcDataToWrite.length} TVC products: '${tvcListSheetName}'`);
+                    }
+                }
+                
+                const finalCumulativePercentage = totalConversionsFromCostingProducts > 0 ? (cumulativeConversions / totalConversionsFromCostingProducts) * 100 : 0;
+                rulesData.push([`Top ${targetPercentage}% Contributors`, 'Highest Conversions in Group', highestVolume !== 'N/A' ? highestVolume.toFixed(2) : 'N/A', 'The highest conversion count for a single product in this group.', productCount]);
+                rulesData.push([`Top ${targetPercentage}% Contributors`, 'Average Conversions in Group', averageVolume.toFixed(2), 'The average (mean) conversion count for a product in this group.', productCount]);
+                rulesData.push([`Top ${targetPercentage}% Contributors`, 'Median Conversions in Group', medianVolume.toFixed(2), 'The median (middle) conversion value, representing a typical product in this group.', productCount]);
+                rulesData.push([`Top ${targetPercentage}% Contributors`, 'Lowest Conversions in Group', lowestVolume !== 'N/A' ? lowestVolume.toFixed(2) : 'N/A', 'The lowest conversion count for a product to be included in this group.', productCount]);
+                rulesData.push([`Top ${targetPercentage}% Contributors`, 'Total Cost (of this group)', totalCost.toFixed(2), 'The total cost of all products in this contributor group.', productCount]);
+                rulesData.push([`Top ${targetPercentage}% Contributors`, 'Total Conversion Value (of this group)', totalConvValue.toFixed(2), 'The total conversion value generated by all products in this contributor group.', productCount]);
+                rulesData.push([`Top ${targetPercentage}% Contributors`, 'Total ROAS (of this group)', totalRoas.toFixed(2), 'The total ROAS (Total Conv. Value / Total Cost) of all products in this contributor group.', productCount]);
+                rulesData.push([`Top ${targetPercentage}% Contributors`, 'Cumulative Contribution', `${finalCumulativePercentage.toFixed(2)}%`, `These ${productCount} products collectively make up this percentage of sales.`, productCount]);
+                rulesData.push(['---', '---', '---', '---', '---']);
+            }
+        }
+    }
+    
+    const isZombie = p => p[4] === 0 && p[3] >= 0;
+    const underperformingCosts = productData.filter(prod => prod[8] < 1 && prod[5] > 0).map(prod => prod[5]);
+    const spendThreshold = calculateMedian(underperformingCosts);
+    const isSuppressed = p => p[8] < 1 && p[5] > spendThreshold;
+    const isTopPerformer_Conservative = p => p[6] >= conversionThreshold && p[8] >= conservativeRoasThreshold;
+    const isTopPerformer_Balanced = p => p[6] >= conversionThreshold && p[8] >= balancedRoasThreshold;
+    const isTopPerformer_Aggressive = p => p[6] >= conversionThreshold && p[8] >= aggressiveRoasThreshold;
+
+    const zombies = productData.filter(isZombie);
+    const suppressed = productData.filter(p => !isZombie(p) && isSuppressed(p));
+    const remainingProducts = productData.filter(p => !isZombie(p) && !isSuppressed(p));
+    const topPerformersConservative = remainingProducts.filter(isTopPerformer_Conservative);
+    const generalConservative = remainingProducts.filter(p => !isTopPerformer_Conservative(p));
+    const topPerformersBalanced = remainingProducts.filter(isTopPerformer_Balanced);
+    const generalBalanced = remainingProducts.filter(p => !isTopPerformer_Balanced(p));
+    const topPerformersAggressive = remainingProducts.filter(isTopPerformer_Aggressive);
+    const generalAggressive = remainingProducts.filter(p => !isTopPerformer_Aggressive(p));
+
+    const formatCountWithPercentage = (count, total) => {
+      if (total === 0) return count;
+      return `${count} (${((count / total) * 100).toFixed(1)}%)`;
+    };
+
+    const totalProducts = productData.length;
+    rulesData.push(['Suggested Product Bucketing Models', 'Category', 'Rule Definition', 'Description', 'Products Matching']);
+    rulesData.push(['---', '---', '---', '---', '---']);
+    rulesData.push(['Constant Categories', 'Zombies', 'Clicks = 0', 'Products with no clicks. They are inactive and are not engaging users.', formatCountWithPercentage(zombies.length, totalProducts)]);
+    rulesData.push(['', 'Suppressed', `ROAS < 1 AND Cost > ${spendThreshold.toFixed(2)}`, 'Products spending significantly but unprofitably. The spend threshold is the median cost of all unprofitable products.', formatCountWithPercentage(suppressed.length, totalProducts)]);
+    rulesData.push(['---', '---', '---', '---', '---']);
+    rulesData.push(['Model 1: Conservative', 'Top Performers', `ROAS >= ${conservativeRoasThreshold.toFixed(2)} AND Conv. >= ${conversionThreshold.toFixed(2)}`, `Uses the 30th percentile ROAS and 30th percentile Conversions of the TVC group as the benchmark. A lower bar to be a top performer.`, formatCountWithPercentage(topPerformersConservative.length, totalProducts)]);
+    rulesData.push(['', 'General', '-', 'Products not identified as Zombie, Suppressed, or Top Performer under this model.', formatCountWithPercentage(generalConservative.length, totalProducts)]);
+    rulesData.push(['---', '---', '---', '---', '---']);
+    rulesData.push(['Model 2: Balanced', 'Top Performers', `ROAS >= ${balancedRoasThreshold.toFixed(2)} AND Conv. >= ${conversionThreshold.toFixed(2)}`, `Uses the Median (50th %ile) ROAS and 30th %ile Conversions of the TVC group. A balanced benchmark.`, formatCountWithPercentage(topPerformersBalanced.length, totalProducts)]);
+    rulesData.push(['', 'General', '-', 'Products not identified as Zombie, Suppressed, or Top Performer under this model.', formatCountWithPercentage(generalBalanced.length, totalProducts)]);
+    rulesData.push(['---', '---', '---', '---', '---']);
+    rulesData.push(['Model 3: Aggressive', 'Top Performers', `ROAS >= ${aggressiveRoasThreshold.toFixed(2)} AND Conv. >= ${conversionThreshold.toFixed(2)}`, `Uses the 75th percentile ROAS and 30th %ile Conversions of the TVC group. A high bar for top performers.`, formatCountWithPercentage(topPerformersAggressive.length, totalProducts)]);
+    rulesData.push(['', 'General', '-', 'Products not identified as Zombie, Suppressed, or Top Performer under this model.', formatCountWithPercentage(generalAggressive.length, totalProducts)]);
+    rulesData.push(['---', '---', '---', '---', '---']);
+    
+    const allImpressions = productData.map(p => p[3]).filter(val => val > 0);
+    const allClicks = productData.map(p => p[4]).filter(val => val > 0);
+    const allNonZeroConversions = productData.map(p => p[6]).filter(val => val > 0);
+    rulesData.push(['Account-wide Informational Stats', 'Median Impressions', calculateMedian(allImpressions).toFixed(0), 'Median impressions across all products that had impressions.', '-']);
+    rulesData.push(['', 'Median Clicks', calculateMedian(allClicks).toFixed(0), 'Median clicks across all products that had clicks.', '-']);
+    rulesData.push(['', 'Median Conversions', calculateMedian(allNonZeroConversions).toFixed(2), 'Median conversions across all products that had conversions.', '-']);
+
+    if (rulesData.length > 0) {
+        if(rulesData[rulesData.length-1][0] === '---') rulesData.pop();
+        rulesSheet.getRange(3, 1, rulesData.length, headers.length).setValues(rulesData);
+    }
+    
+    Logger.log(`Successfully wrote ${rulesData.length} rule definitions to ${rulesSheetName}`);
+}
+
+// --- This entire function is new ---
+function processAndDisplayConsistentPerformers(spreadsheet, allTvcProductLists) {
+    if (allTvcProductLists.length === 0 || allTvcProductLists.length < DATE_RANGES_IN_DAYS.length) {
+        Logger.log(`Not enough data to find consistent performers. Expected ${DATE_RANGES_IN_DAYS.length} TVC lists, but got ${allTvcProductLists.length}. Some date ranges may have had no sales.`);
+        return;
+    }
+
+    Logger.log('--- Finding Consistently Performing TVC Products Across All Date Ranges ---');
+    
+    let intersection = new Set(allTvcProductLists[0]);
+    for (let i = 1; i < allTvcProductLists.length; i++) {
+        intersection = new Set([...intersection].filter(productId => allTvcProductLists[i].has(productId)));
+    }
+
+    const consistentProductIds = Array.from(intersection);
+    Logger.log(`Found ${consistentProductIds.length} products present in all TVC lists.`);
+    
+    let sheet = spreadsheet.getSheetByName(CONSISTENT_PERFORMERS_SHEET_NAME);
+    if (sheet) {
+        spreadsheet.deleteSheet(sheet);
+    }
+    sheet = spreadsheet.insertSheet(CONSISTENT_PERFORMERS_SHEET_NAME, 0); 
+    
+    sheet.clear();
+    const headers = ['Consistently Performing Item ID'];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    
+    if (consistentProductIds.length > 0) {
+        const dataToWrite = consistentProductIds.map(id => [id]);
+        sheet.getRange(2, 1, dataToWrite.length, 1).setValues(dataToWrite);
+        Logger.log(`Wrote ${consistentProductIds.length} consistent performer IDs to sheet '${CONSISTENT_PERFORMERS_SHEET_NAME}'.`);
+    } else {
+        sheet.getRange(2, 1).setValue('No products were found to be in the Top 75% Contributors list across all specified date ranges.');
+        Logger.log(`No consistent performers found.`);
+    }
+
+    spreadsheet.setActiveSheet(sheet);
+    spreadsheet.moveActiveSheet(1);
+}
+
+// --- Statistical Helper Functions ---
+function calculateMedian(numbers) {
+  if (!numbers || numbers.length === 0) return 0;
+  const sorted = Array.from(numbers).filter(n => typeof n === 'number' && !isNaN(n)).sort((a, b) => a - b);
+  if (sorted.length === 0) return 0;
+
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return middle > 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : 0;
+  }
+  return sorted[middle];
+}
+
+function calculatePercentile(numbers, percentile) {
+  if (!numbers || numbers.length === 0) return 0;
+  const numericNumbers = numbers.filter(n => typeof n === 'number' && !isNaN(n));
+  if (numericNumbers.length === 0) return 0;
+
+  if (percentile <= 0) return Math.min(...numericNumbers);
+  if (percentile >= 100) return Math.max(...numericNumbers);
+
+  const sorted = Array.from(numericNumbers).sort((a, b) => a - b);
+  const index = Math.ceil((percentile / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, index)];
+}

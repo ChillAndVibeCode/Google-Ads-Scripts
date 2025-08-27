@@ -1,0 +1,232 @@
+      
+// --- SCRIPT SETTINGS - PLEASE UPDATE ---
+
+// The full URL of the Google Sheet where the report will be saved.
+// A new, blank sheet works best. The script will create the necessary tabs.
+const SPREADSHEET_URL = "YOUR_SPREADSHEET_URL_HERE"; 
+
+// A comma-separated list of email addresses to receive alerts.
+// Example: "email1@example.com,email2@example.com"
+const EMAIL_RECIPIENTS = "YOUR_EMAIL_HERE";
+
+// The names for the sheets that will be created in your spreadsheet.
+const STANDARD_ADS_SHEET_NAME = "Disapproved Ads Report";
+const PMAX_ASSETS_SHEET_NAME = "PMax Policy Issues Report";
+
+// --- NO CHANGES NEEDED BELOW THIS LINE ---
+
+const STANDARD_ADS_HEADER = [
+    "Timestamp", 
+    "Campaign Name", 
+    "Ad Group Name", 
+    "Ad ID",
+    "Ad Type",
+    "Ad Status",
+    "Disapproval Reason"
+];
+
+const PMAX_ASSETS_HEADER = [
+    "Timestamp", 
+    "Campaign Name", 
+    "Asset Group Name", 
+    "Asset ID",
+    "Asset Type",
+    "Asset Details",
+    "Approval Status",
+    "Policy Reason"
+];
+
+/**
+ * Main function to orchestrate the check for disapproved ads and assets.
+ */
+function main() {
+    Logger.log("Starting disapproval check script...");
+    const timestamp = getFormattedTimestamp();
+
+    // 1. Check non-PMax campaigns for disapproved ads
+    const disapprovedAds = getDisapprovedStandardAds(timestamp);
+    if (disapprovedAds.length > 0) {
+        Logger.log(`Found ${disapprovedAds.length} disapproved ads in standard campaigns.`);
+        writeToSheet(STANDARD_ADS_SHEET_NAME, STANDARD_ADS_HEADER, disapprovedAds);
+    } else {
+        Logger.log("No disapproved ads found in standard campaigns.");
+    }
+
+    // 2. Check PMax campaigns for assets with policy issues
+    const pmaxIssues = getPmaxAssetIssues(timestamp);
+    if (pmaxIssues.length > 0) {
+        Logger.log(`Found ${pmaxIssues.length} PMax assets with policy issues.`);
+        writeToSheet(PMAX_ASSETS_SHEET_NAME, PMAX_ASSETS_HEADER, pmaxIssues);
+    } else {
+        Logger.log("No policy issues found for PMax assets.");
+    }
+    
+    // 3. Send a summary email if any issues were found
+    if (disapprovedAds.length > 0 || pmaxIssues.length > 0) {
+        sendNotificationEmail(disapprovedAds.length, pmaxIssues.length);
+    }
+    
+    Logger.log("Script finished.");
+}
+
+/**
+ * Fetches disapproved ads from all enabled, non-PMax campaigns.
+ * @param {string} timestamp - The current formatted timestamp.
+ * @returns {Array<Array<string>>} A 2D array of disapproved ad data.
+ */
+function getDisapprovedStandardAds(timestamp) {
+    Logger.log("Querying for disapproved ads in non-PMax campaigns...");
+    const issues = [];
+    
+    const gaqlQuery = `
+        SELECT
+            campaign.name,
+            ad_group.name,
+            ad_group_ad.ad.id,
+            ad_group_ad.ad.type,
+            ad_group_ad.policy_summary.approval_status,
+            ad_group_ad.policy_summary.policy_topic_entries
+        FROM ad_group_ad
+        WHERE ad_group_ad.policy_summary.approval_status = 'DISAPPROVED'
+            AND campaign.advertising_channel_type NOT IN ('PERFORMANCE_MAX')
+            AND campaign.status = 'ENABLED'
+            AND ad_group.status = 'ENABLED'
+    `;
+    
+    const results = AdsApp.search(gaqlQuery);
+
+    while (results.hasNext()) {
+        const row = results.next();
+        const campaignName = row.campaign.name;
+        const adGroupName = row.adGroup.name;
+        const ad = row.adGroupAd.ad;
+        const policySummary = row.adGroupAd.policySummary;
+        const policyFindings = parsePolicyFindings(policySummary.policyTopicEntries);
+        
+        issues.push([
+            timestamp,
+            campaignName,
+            adGroupName,
+            ad.id,
+            ad.type,
+            policySummary.approvalStatus,
+            policyFindings
+        ]);
+    }
+    
+    return issues;
+}
+
+/**
+ * Fetches assets with policy issues from all enabled PMax campaigns.
+ * @param {string} timestamp - The current formatted timestamp.
+ * @returns {Array<Array<string>>} A 2D array of asset issue data.
+ */
+function getPmaxAssetIssues(timestamp) {
+    Logger.log("Querying for PMax asset policy issues...");
+    const issues = [];
+    
+    // UPDATED QUERY: The approval_status filter has been REMOVED from the WHERE clause
+    // because it is not a filterable field. We will filter in the script itself.
+    const gaqlQuery = `
+        SELECT
+            campaign.name,
+            asset_group.name,
+            asset.id,
+            asset.type,
+            asset.text_asset.text,
+            asset.image_asset.full_size.url,
+            asset_group_asset.policy_summary.approval_status,
+            asset_group_asset.policy_summary.policy_topic_entries
+        FROM asset_group_asset
+        WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX'
+            AND campaign.status = 'ENABLED'
+            AND asset_group.status = 'ENABLED'
+    `;
+    
+    const results = AdsApp.search(gaqlQuery);
+
+    while (results.hasNext()) {
+        const row = results.next();
+        const policySummary = row.assetGroupAsset.policySummary;
+        const approvalStatus = policySummary.approvalStatus;
+
+        // NEW: Check the approval status in the script since we cannot filter in the query.
+        // We check for 'DISAPPROVED' and 'APPROVED_LIMITED'.
+        if (approvalStatus === 'DISAPPROVED' || approvalStatus === 'APPROVED_LIMITED') {
+            const asset = row.asset;
+            const policyFindings = parsePolicyFindings(policySummary.policyTopicEntries);
+            
+            let assetDetails = 'N/A';
+            if (asset.textAsset && asset.textAsset.text) {
+                assetDetails = asset.textAsset.text;
+            } else if (asset.imageAsset && asset.imageAsset.fullSize.url) {
+                assetDetails = asset.imageAsset.fullSize.url;
+            }
+
+            issues.push([
+                timestamp,
+                row.campaign.name,
+                row.assetGroup.name,
+                asset.id,
+                asset.type,
+                assetDetails,
+                approvalStatus, // Will show DISAPPROVED or APPROVED_LIMITED
+                policyFindings
+            ]);
+        }
+    }
+    
+    return issues;
+}
+
+/**
+ * Writes data rows to a specified sheet in the spreadsheet.
+ */
+function writeToSheet(sheetName, headers, dataRows) {
+    if (!dataRows || dataRows.length === 0) return;
+    try {
+        const ss = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+        let sheet = ss.getSheetByName(sheetName);
+        if (!sheet) {
+            sheet = ss.insertSheet(sheetName);
+            sheet.appendRow(headers);
+            sheet.setFrozenRows(1);
+            headers.forEach((_, i) => sheet.autoResizeColumn(i + 1));
+        }
+        sheet.getRange(sheet.getLastRow() + 1, 1, dataRows.length, headers.length).setValues(dataRows);
+        Logger.log(`Successfully wrote ${dataRows.length} rows to sheet: "${sheetName}"`);
+    } catch (e) {
+        Logger.log(`Failed to write to spreadsheet. Error: ${e.message}`);
+    }
+}
+
+/**
+ * Sends a notification email summarizing the findings.
+ */
+function sendNotificationEmail(adCount, assetCount) {
+    const accountName = AdsApp.currentAccount().getName();
+    const subject = `[Google Ads Alert] Policy Issues Found in ${accountName}`;
+    let body = `Hello,\n\nThe script has found policy violations in your Google Ads account "${accountName}".\n\n`;
+    if (adCount > 0) body += `  - Number of Disapproved Ads (Standard Campaigns): ${adCount}\n`;
+    if (assetCount > 0) body += `  - Number of Assets with Policy Issues (PMax): ${assetCount}\n`;
+    body += `\nPlease see the spreadsheet for complete details:\n${SPREADSHEET_URL}\n\nThis is an automated notification.\n`;
+    MailApp.sendEmail(EMAIL_RECIPIENTS, subject, body);
+    Logger.log(`Notification email sent to ${EMAIL_RECIPIENTS}`);
+}
+
+/**
+ * Parses policy topic entries into a single comma-separated string.
+ */
+function parsePolicyFindings(policyTopicEntries) {
+    if (!policyTopicEntries || policyTopicEntries.length === 0) return "No policy topic found.";
+    return policyTopicEntries.map(entry => entry.topic).join(", ");
+}
+
+/**
+ * Gets the current date and time formatted for the spreadsheet.
+ */
+function getFormattedTimestamp() {
+    const tz = AdsApp.currentAccount().getTimeZone();
+    return Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm:ss");
+}
