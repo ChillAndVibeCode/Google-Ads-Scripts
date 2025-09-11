@@ -1,0 +1,488 @@
+// ===================================================================================
+// --- UNIFIED GOOGLE ADS ACCOUNT MONITOR SCRIPT (V10 - Final) ---
+// ===================================================================================
+// This script combines four separate monitoring tasks into one:
+// 1. Disapproved Ads & Assets Monitor
+// 2. Out-of-Stock Product Monitor
+// 3. Disapproved Products Monitor
+// 4. Campaign Spend & Budget Analysis
+// ===================================================================================
+
+const CONFIG = {
+    // --- General Settings ---
+    SPREADSHEET_URL: "YOUR_SPREADSHEET_URL_HERE", // **REQUIRED**
+    EMAIL_RECIPIENTS: "YOUR_EMAILS_HERE", // **REQUIRED** - Comma-separated
+
+    // --- 1. Disapproved Ads & Assets Monitor Settings ---
+    ADS_CHECK_SHEETS: {
+        STANDARD_ADS: "Disapproved Ads Report",
+        PMAX_ASSETS: "PMax Policy Issues Report",
+    },
+
+    // --- 2. Out-of-Stock Product Monitor Settings ---
+    OOS_CHECK_SHEETS: {
+        SUMMARY: "Inventory Summary",
+        OOS_IDS: "Out of Stock IDs",
+    },
+    OOS_ALERT_THRESHOLD: 0.10, // Alert on a 10% increase in out-of-stock items
+
+    // --- 3. Disapproved Products Monitor Settings ---
+    DISAPPROVED_PRODUCTS_SHEET: "Disapproved Products Report",
+    DISAPPROVED_PRODUCTS_ALERT_THRESHOLD: 0.10, // Alert on a 10% increase in disapproved items
+
+    // --- 4. Campaign Spend & Budget Analysis Settings ---
+    SPEND_ANALYSIS_SHEETS: {
+        PERFORMANCE_REPORT: "Campaign Performance Report",
+        SPEND_SUMMARY: "Spend Summary",
+        BUDGET_RECOMMENDATIONS: "Budget Recommendations",
+    },
+    SPEND_DATE_RANGE: 'LAST_7_DAYS', // YESTERDAY, LAST_7_DAYS, LAST_30_DAYS
+    CAMPAIGN_IDENTIFIERS: {
+        PMAX: ['Pmax'],
+        PMAX_GENERAL: ['Pmax_General', 'PmaxFeed_General'],
+        EXCLUDED: ['Zombies', 'Suppression', 'Suppressed'],
+    },
+    BUDGET_RECOMMENDATION_THRESHOLDS: {
+        CONVERSION_VALUE_CHANGE: 0.15, // 15% change to trigger a recommendation
+        BUDGET_ADJUSTMENT_PERCENTAGE: 0.10, // Recommend a 10% budget change
+    },
+};
+
+// ===================================================================================
+// --- MAIN CONTROLLER FUNCTION ---
+// ===================================================================================
+function main() {
+    Logger.log("--- Starting Unified Account Monitor Script ---");
+    const spreadsheet = getSpreadsheet();
+    if (!spreadsheet) {
+        Logger.log("FATAL: Could not open spreadsheet. Aborting script.");
+        return;
+    }
+
+    const tasks = [
+        { name: "Disapproved Ads & Assets Check", func: runDisapprovedAdsCheck },
+        { name: "Out-of-Stock Product Monitor", func: runOutOfStockMonitor },
+        { name: "Disapproved Products Monitor", func: runDisapprovedProductsMonitor },
+        { name: "Campaign Spend & Budget Analysis", func: runCampaignSpendAnalysis },
+    ];
+
+    for (const task of tasks) {
+        try {
+            Logger.log(`\n>>> Running Task: ${task.name}...`);
+            task.func(spreadsheet);
+            Logger.log(`<<< Task Finished: ${task.name}.`);
+        } catch (e) {
+            Logger.log(`!!! ERROR in task '${task.name}': ${e.message}\n${e.stack}`);
+            sendEmail(
+                `[Google Ads Script Error] Task Failed: ${task.name}`,
+                `The script encountered an error while running the '${task.name}' task.\n\nError: ${e.message}\n\nPlease check the script logs for more details.`
+            );
+        }
+    }
+
+    Logger.log("\n--- Unified Account Monitor Script Finished ---\n");
+}
+
+
+// ===================================================================================
+// --- MODULE 1: DISAPPROVED ADS & ASSETS CHECK ---
+// ===================================================================================
+function runDisapprovedAdsCheck(spreadsheet) {
+    const timestamp = getFormattedTimestamp();
+    const disapprovedAds = getDisapprovedStandardAds(timestamp);
+    if (disapprovedAds.length > 0) {
+        Logger.log(`Found ${disapprovedAds.length} disapproved ads in standard campaigns.`);
+        writeToSheet(spreadsheet, CONFIG.ADS_CHECK_SHEETS.STANDARD_ADS, ["Timestamp", "Campaign Name", "Ad Group Name", "Ad ID", "Ad Type", "Ad Status", "Disapproval Reason"], disapprovedAds, true);
+    } else { Logger.log("No disapproved ads found in standard campaigns."); }
+
+    const pmaxIssues = getPmaxAssetIssues(timestamp);
+    if (pmaxIssues.length > 0) {
+        Logger.log(`Found ${pmaxIssues.length} PMax assets with policy issues.`);
+        writeToSheet(spreadsheet, CONFIG.ADS_CHECK_SHEETS.PMAX_ASSETS, ["Timestamp", "Campaign Name", "Asset Group Name", "Asset ID", "Asset Type", "Asset Details", "Approval Status", "Policy Reason"], pmaxIssues, true);
+    } else { Logger.log("No policy issues found for PMax assets."); }
+
+    if (disapprovedAds.length > 0 || pmaxIssues.length > 0) {
+        const accountName = AdsApp.currentAccount().getName();
+        const subject = `[Google Ads Alert] Policy Issues Found in ${accountName}`;
+        let body = `Hello,\n\nThe script has found policy violations in your Google Ads account "${accountName}".\n\n`;
+        if (disapprovedAds.length > 0) body += `  - Number of Disapproved Ads (Standard Campaigns): ${disapprovedAds.length}\n`;
+        if (pmaxIssues.length > 0) body += `  - Number of Assets with Policy Issues (PMax): ${pmaxIssues.length}\n`;
+        body += `\nPlease see the spreadsheet for complete details:\n${CONFIG.SPREADSHEET_URL}\n\nThis is an automated notification.\n`;
+        sendEmail(subject, body);
+        Logger.log(`Policy violation email sent to ${CONFIG.EMAIL_RECIPIENTS}.`);
+    }
+}
+
+function getDisapprovedStandardAds(timestamp) {
+    const issues = []; const gaqlQuery = `SELECT campaign.name, ad_group.name, ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.policy_summary.approval_status, ad_group_ad.policy_summary.policy_topic_entries FROM ad_group_ad WHERE ad_group_ad.policy_summary.approval_status = 'DISAPPROVED' AND campaign.advertising_channel_type NOT IN ('PERFORMANCE_MAX') AND campaign.status = 'ENABLED' AND ad_group.status = 'ENABLED'`;
+    const results = AdsApp.search(gaqlQuery); while (results.hasNext()) { const row = results.next(); issues.push([timestamp, row.campaign.name, row.adGroup.name, row.adGroupAd.ad.id, row.adGroupAd.ad.type, row.adGroupAd.policySummary.approvalStatus, parsePolicyFindings(row.adGroupAd.policySummary.policyTopicEntries)]); } return issues;
+}
+function getPmaxAssetIssues(timestamp) {
+    const issues = []; const gaqlQuery = `SELECT campaign.name, asset_group.name, asset.id, asset.type, asset.text_asset.text, asset.image_asset.full_size.url, asset_group_asset.policy_summary.approval_status, asset_group_asset.policy_summary.policy_topic_entries FROM asset_group_asset WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX' AND campaign.status = 'ENABLED' AND asset_group.status = 'ENABLED'`;
+    const results = AdsApp.search(gaqlQuery); while (results.hasNext()) { const row = results.next(); const approvalStatus = row.assetGroupAsset.policySummary.approvalStatus; if (approvalStatus === 'DISAPPROVED' || approvalStatus === 'APPROVED_LIMITED') { let assetDetails = 'N/A'; if (row.asset.textAsset && row.asset.textAsset.text) { assetDetails = row.asset.textAsset.text; } else if (row.asset.imageAsset && row.asset.imageAsset.fullSize.url) { assetDetails = row.asset.imageAsset.fullSize.url; } issues.push([timestamp, row.campaign.name, row.assetGroup.name, row.asset.id, row.asset.type, assetDetails, approvalStatus, parsePolicyFindings(row.assetGroupAsset.policySummary.policyTopicEntries)]); } } return issues;
+}
+function parsePolicyFindings(policyTopicEntries) {
+    if (!policyTopicEntries || policyTopicEntries.length === 0) return "No policy topic found."; return policyTopicEntries.map(entry => entry.topic).join(", ");
+}
+
+// ===================================================================================
+// --- MODULE 2: OUT-OF-STOCK PRODUCT MONITOR ---
+// ===================================================================================
+function runOutOfStockMonitor(spreadsheet) {
+    const productData = getProductInventoryData(); const accountName = AdsApp.currentAccount().getName(); const accountId = AdsApp.currentAccount().getCustomerId(); const summarySheet = getOrCreateSheet(spreadsheet, CONFIG.OOS_CHECK_SHEETS.SUMMARY); const oosSheet = getOrCreateSheet(spreadsheet, CONFIG.OOS_CHECK_SHEETS.OOS_IDS);
+    setupOOSSummarySheet(summarySheet); setupOutOfStockIDSheet(oosSheet); const outOfStockCount = productData.outOfStockProducts.length; const totalProducts = productData.totalProducts; const outOfStockPercentage = totalProducts > 0 ? (outOfStockCount / totalProducts) : 0; const currentRunData = { timestamp: new Date(), accountId, accountName, totalProducts, outOfStockCount, outOfStockPercentage, outOfStockProductIDs: productData.outOfStockProducts };
+    const nextRow = summarySheet.getLastRow() + 1; const summaryRowData = [accountId, accountName, currentRunData.timestamp, totalProducts, outOfStockCount, outOfStockPercentage]; summarySheet.getRange(nextRow, 1, 1, summaryRowData.length).setValues([summaryRowData]); summarySheet.getRange(nextRow, 6).setNumberFormat('0.00%'); Logger.log(`OOS summary data added to row ${nextRow}.`);
+    populateOutOfStockIDSheet(oosSheet, currentRunData.outOfStockProductIDs); checkAndSendOOSAlert(summarySheet, currentRunData);
+}
+function getProductInventoryData() {
+    let totalProducts = 0; let outOfStockProducts = []; const processedProducts = new Set(); const productQuery = `SELECT shopping_product.item_id, shopping_product.availability FROM shopping_product WHERE shopping_product.channel = 'ONLINE'`;
+    try { const results = AdsApp.search(productQuery); while (results.hasNext()) { const row = results.next(); const productId = row.shoppingProduct.itemId; if (processedProducts.has(productId)) continue; processedProducts.add(productId); totalProducts++; if (row.shoppingProduct.availability === 'OUT_OF_STOCK') { outOfStockProducts.push(productId); } } Logger.log(`Successfully fetched ${totalProducts} products from Merchant Center.`);
+    } catch (e) { Logger.log(`Could not run shopping_product query. Error: ${e}.`); return { totalProducts: 0, outOfStockProducts: [] }; } return { totalProducts, outOfStockProducts };
+}
+function setupOOSSummarySheet(sheet) {
+    const headers = ['Account ID', 'Account Name', 'Timestamp', 'Total Products', 'Products Out of Stock', '% Out of Stock']; const firstRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0]; if (firstRow.join('') !== headers.join('')) { sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold'); headers.forEach((_, i) => sheet.autoResizeColumn(i + 1)); }
+}
+function setupOutOfStockIDSheet(sheet) {
+    const header = 'Product ID'; if (sheet.getRange(1, 1).getValue() !== header) { sheet.getRange(1, 1).setValue(header).setFontWeight('bold'); sheet.autoResizeColumn(1); }
+}
+function populateOutOfStockIDSheet(sheet, oosProductIds) {
+    if (sheet.getLastRow() > 1) { sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).clearContent(); } if (oosProductIds && oosProductIds.length > 0) { const idsToWrite = oosProductIds.map(id => [id]); sheet.getRange(2, 1, idsToWrite.length, 1).setValues(idsToWrite); Logger.log(`Wrote ${oosProductIds.length} out-of-stock IDs to sheet.`); }
+}
+function checkAndSendOOSAlert(summarySheet, currentData) {
+    const lastRowIndex = summarySheet.getLastRow(); if (lastRowIndex < 3) { Logger.log('Not enough data for OOS comparison yet.'); return; }
+    const previousOutOfStockCount = summarySheet.getRange(lastRowIndex - 1, 5).getValue(); const currentOutOfStockCount = currentData.outOfStockCount; let percentageIncrease = null; let send = false; if (previousOutOfStockCount > 0) { percentageIncrease = (currentOutOfStockCount - previousOutOfStockCount) / previousOutOfStockCount; if (percentageIncrease >= CONFIG.OOS_ALERT_THRESHOLD) send = true; } else if (currentOutOfStockCount > 0) { send = true; }
+    if (send) { const increaseText = percentageIncrease !== null ? `${(percentageIncrease * 100).toFixed(1)}%` : 'from 0'; const subject = `🚨 Out-of-Stock Products Alert for ${currentData.accountName}: ${increaseText} increase`; const body = `<h2>Out-of-Stock Products Alert</h2><p><strong>Account:</strong> ${currentData.accountName} (${currentData.accountId})</p><p><strong>Comparison:</strong></p><ul><li><strong>Previous Run:</strong> ${previousOutOfStockCount} products out of stock</li><li><strong>Current Run:</strong> ${currentOutOfStockCount} products out of stock</li><li><strong>Change:</strong> ${increaseText} increase</li></ul><p>A full list of out-of-stock product IDs is in the <a href="${CONFIG.SPREADSHEET_URL}">spreadsheet</a>.</p>`; sendEmail(subject, body, true); Logger.log(`Out-of-stock alert sent. Change: ${increaseText}`); }
+}
+
+// ===================================================================================
+// --- MODULE 3: DISAPPROVED PRODUCTS MONITOR ---
+// ===================================================================================
+function runDisapprovedProductsMonitor(spreadsheet) {
+    const productData = getDisapprovedProductData();
+    if (!productData) {
+        Logger.log("Aborting Disapproved Products Monitor due to data fetch failure.");
+        return;
+    }
+    const sheet = getOrCreateSheet(spreadsheet, CONFIG.DISAPPROVED_PRODUCTS_SHEET);
+    setupDisapprovedProductsSheet(sheet);
+    
+    const currentWeekData = {
+        date: new Date().toISOString().split('T')[0],
+        accountName: AdsApp.currentAccount().getName(),
+        totalProductCount: productData.totalProducts,
+        suspendedCount: productData.suspendedProducts.length,
+        suspendedProductIDs: productData.suspendedProducts.join(', ')
+    };
+    
+    const dataRow = [currentWeekData.date, currentWeekData.accountName, currentWeekData.totalProductCount, currentWeekData.suspendedCount, currentWeekData.suspendedProductIDs];
+    sheet.appendRow(dataRow);
+    Logger.log('Appended disapproved products data to sheet.');
+    
+    checkAndSendDisapprovedProductsAlert(sheet, currentWeekData);
+}
+
+// *** MODIFIED FUNCTION V10 ***
+function getDisapprovedProductData() {
+    let suspendedProducts = new Set();
+    let totalProductIds = new Set();
+    
+    try {
+        // Step 1: Get the resource names of all disapproved product criteria.
+        const disapprovedCriterionQuery = `
+            SELECT ad_group_criterion.resource_name
+            FROM ad_group_criterion
+            WHERE ad_group_criterion.approval_status = 'DISAPPROVED'
+              AND ad_group_criterion.type = 'LISTING_GROUP'
+              AND campaign.status = 'ENABLED'`;
+
+        const disapprovedCriterionResources = new Set();
+        const disapprovedResults = AdsApp.search(disapprovedCriterionQuery);
+        while (disapprovedResults.hasNext()) {
+            const row = disapprovedResults.next();
+            disapprovedCriterionResources.add(row.adGroupCriterion.resourceName);
+        }
+        Logger.log(`Found ${disapprovedCriterionResources.size} disapproved product criteria.`);
+        if (disapprovedCriterionResources.size === 0) {
+            return { totalProducts: 0, suspendedProducts: [] }; // Early exit if no disapprovals
+        }
+
+        // Step 2: Get all products and check if their criterion is in our disapproved set.
+        const allProductsQuery = `
+            SELECT segments.product_item_id, ad_group_criterion.resource_name
+            FROM shopping_performance_view
+            WHERE segments.date DURING LAST_30_DAYS AND campaign.status = 'ENABLED'`;
+
+        const allProductsResults = AdsApp.search(allProductsQuery);
+        while (allProductsResults.hasNext()) {
+            const row = allProductsResults.next();
+            if (row.segments && row.segments.productItemId) {
+                totalProductIds.add(row.segments.productItemId);
+
+                // Check if this product's criterion is in our disapproval set
+                if (disapprovedCriterionResources.has(row.adGroupCriterion.resourceName)) {
+                    suspendedProducts.add(row.segments.productItemId);
+                }
+            }
+        }
+        
+        Logger.log(`Found ${totalProductIds.size} total products and matched ${suspendedProducts.size} to disapprovals.`);
+        
+        return {
+            totalProducts: totalProductIds.size,
+            suspendedProducts: Array.from(suspendedProducts)
+        };
+
+    } catch (e) {
+        Logger.log(`Could not query for product data. Error: ${e}`);
+        return null;
+    }
+}
+
+
+function setupDisapprovedProductsSheet(sheet) {
+    const headers = ['DATE', 'AccountName', 'TotalProductCount', 'SuspendedCount', 'SuspendedProductIDs'];
+    if (sheet.getRange(1, 1).getValue() !== 'DATE') {
+        sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+        headers.forEach((_,i) => sheet.autoResizeColumn(i + 1));
+    }
+}
+
+function checkAndSendDisapprovedProductsAlert(sheet, currentData) {
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 3) {
+      Logger.log('Not enough data for disapproved product comparison yet.');
+      return;
+    }
+    const previousSuspendedCount = sheet.getRange(lastRow - 1, 4).getValue();
+    const currentSuspendedCount = currentData.suspendedCount;
+    let percentageIncrease = null;
+    let send = false;
+    if (previousSuspendedCount > 0) {
+        percentageIncrease = (currentSuspendedCount - previousSuspendedCount) / previousSuspendedCount;
+        if (percentageIncrease >= CONFIG.DISAPPROVED_PRODUCTS_ALERT_THRESHOLD) send = true;
+    } else if (currentSuspendedCount > 0) {
+        send = true;
+    }
+
+    if (send) {
+        const increaseText = percentageIncrease !== null ? `${(percentageIncrease * 100).toFixed(1)}%` : 'from 0';
+        const subject = `🚨 Product Disapproval Alert: ${increaseText} increase detected`;
+        const body = `<h2>Product Disapproval Alert</h2><p><strong>Account:</strong> ${currentData.accountName}</p><p><strong>Comparison:</strong></p><ul><li><strong>Previous Week:</strong> ${previousSuspendedCount} products disapproved/suspended</li><li><strong>Current Week:</strong> ${currentSuspendedCount} products disapproved/suspended</li><li><strong>Change:</strong> ${increaseText} increase</li></ul><p>Please review disapproved products in the <a href="${CONFIG.SPREADSHEET_URL}">spreadsheet</a>.</p>`;
+        sendEmail(subject, body, true);
+        Logger.log(`Disapproved products alert sent. Change: ${increaseText}`);
+    }
+}
+
+// ===================================================================================
+// --- MODULE 4: CAMPAIGN SPEND & BUDGET ANALYSIS ---
+// ===================================================================================
+function runCampaignSpendAnalysis(spreadsheet) {
+    const dateRange = CONFIG.SPEND_DATE_RANGE;
+    const currentPeriodData = getCampaignPerformanceData(dateRange, false);
+    if (!currentPeriodData) return;
+    const previousPeriodDateRange = getPreviousPeriodDateRange(dateRange);
+    const previousPeriodData = getCampaignPerformanceData(previousPeriodDateRange, true);
+    const previousPeriodMap = previousPeriodData.reduce((map, campaign) => (map[campaign.name] = campaign, map), {});
+    let pmaxGeneralSpend = 0;
+    let maxPerformancePmaxSpend = 0;
+    let maxPerformancePmaxCampaignName = 'N/A';
+    let totalAccountCost = 0;
+    const reportSheetRows = [];
+    const recommendations = [];
+    
+    for (const campaign of currentPeriodData) {
+        const previousCampaign = previousPeriodMap[campaign.name] || {};
+        totalAccountCost += campaign.cost;
+        const isPmax = doesCampaignMatchIdentifiers(campaign.name, CONFIG.CAMPAIGN_IDENTIFIERS.PMAX);
+        const isGeneral = doesCampaignMatchIdentifiers(campaign.name, CONFIG.CAMPAIGN_IDENTIFIERS.PMAX_GENERAL);
+        const isExcluded = doesCampaignMatchIdentifiers(campaign.name, CONFIG.CAMPAIGN_IDENTIFIERS.EXCLUDED);
+
+        if (isPmax) {
+            if (isGeneral) {
+                pmaxGeneralSpend += campaign.cost;
+            } else if (!isExcluded && campaign.cost > maxPerformancePmaxSpend) {
+                maxPerformancePmaxSpend = campaign.cost;
+                maxPerformancePmaxCampaignName = campaign.name;
+            }
+        }
+        recommendations.push(generateBudgetRecommendation(campaign, previousCampaign));
+        reportSheetRows.push([ campaign.name, campaign.status, campaign.cost, campaign.impressions, campaign.clicks, campaign.ctr, campaign.conversions, campaign.cpa, campaign.roas ]);
+    }
+
+    if (pmaxGeneralSpend > maxPerformancePmaxSpend && pmaxGeneralSpend > 0) {
+        sendPMaxSpendAlert(pmaxGeneralSpend, maxPerformancePmaxSpend, maxPerformancePmaxCampaignName);
+    }
+    populateSpendReportSheet(spreadsheet, reportSheetRows);
+    populateSpendSummarySheet(spreadsheet, currentPeriodData, totalAccountCost);
+    populateRecommendationSheet(spreadsheet, recommendations);
+}
+
+function getCampaignPerformanceData(dateRange, isPreviousPeriod) {
+    let dateClause;
+    if (dateRange.includes(',')) {
+        const [startDate, endDate] = dateRange.split(',');
+        dateClause = `segments.date BETWEEN '${startDate}' AND '${endDate}'`;
+    } else {
+        dateClause = `segments.date DURING ${dateRange}`;
+    }
+    const budgetFields = isPreviousPeriod ? "" : ", campaign_budget.amount_micros, metrics.search_budget_lost_impression_share";
+    const query = `SELECT campaign.name, campaign.status, metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.ctr, metrics.conversions, metrics.cost_per_conversion, metrics.conversions_value ${budgetFields} FROM campaign WHERE ${dateClause} AND campaign.status != 'REMOVED'`;
+    try {
+        const report = AdsApp.report(query);
+        return Array.from(report.rows()).map(row => {
+            const cost = (row['metrics.cost_micros'] || 0) / 1000000;
+            const conversionsValue = row['metrics.conversions_value'] || 0;
+            const data = { name: row['campaign.name'], status: row['campaign.status'], cost, impressions: row['metrics.impressions'], clicks: row['metrics.clicks'], ctr: row['metrics.ctr'], conversions: row['metrics.conversions'], cpa: row['metrics.cost_per_conversion'], roas: cost > 0 ? conversionsValue / cost : 0, conversionsValue };
+            if (!isPreviousPeriod) {
+                data.dailyBudget = (row['campaign_budget.amount_micros'] || 0) / 1000000;
+                data.budgetLostImpressionShare = row['metrics.search_budget_lost_impression_share'] || 0;
+            }
+            return data;
+        });
+    } catch(e) {
+        Logger.log(`Failed to run campaign performance report. Error: ${e}`);
+        return null;
+    }
+}
+
+function generateBudgetRecommendation(campaign, previousCampaign) {
+    const isLimitedByBudget = (campaign.budgetLostImpressionShare || 0) > 0;
+    const currentConvValue = campaign.conversionsValue;
+    const previousConvValue = previousCampaign.conversionsValue || 0;
+    let convValueChange = 0;
+    if (previousConvValue > 0) {
+        convValueChange = (currentConvValue - previousConvValue) / previousConvValue;
+    } else if (currentConvValue > 0) {
+        convValueChange = 1;
+    }
+    
+    let recommendation = 'No Change';
+    let budgetChangeAmount = 0;
+    const budgetChangePercentage = CONFIG.BUDGET_RECOMMENDATION_THRESHOLDS.BUDGET_ADJUSTMENT_PERCENTAGE;
+    const convValueChangeThreshold = CONFIG.BUDGET_RECOMMENDATION_THRESHOLDS.CONVERSION_VALUE_CHANGE;
+    if (isLimitedByBudget && convValueChange > convValueChangeThreshold) {
+        recommendation = `Increase by ${(budgetChangePercentage * 100)}%`;
+        budgetChangeAmount = campaign.dailyBudget * budgetChangePercentage;
+    } else if (convValueChange < -convValueChangeThreshold) {
+        recommendation = `Decrease by ${(budgetChangePercentage * 100)}%`;
+        budgetChangeAmount = - (campaign.dailyBudget * budgetChangePercentage);
+    }
+    return [ campaign.name, campaign.dailyBudget, (isLimitedByBudget ? 'Yes' : 'No'), currentConvValue, previousConvValue, convValueChange, recommendation, budgetChangeAmount ];
+}
+
+function getPreviousPeriodDateRange(dateRange) {
+    const today = new Date();
+    const timeZone = AdsApp.currentAccount().getTimeZone();
+    const formatDate = (date) => Utilities.formatDate(date, timeZone, 'yyyy-MM-dd');
+    let startDateOffset, endDateOffset;
+    if (dateRange === 'YESTERDAY') { [startDateOffset, endDateOffset] = [2, 2]; }
+    else if (dateRange === 'LAST_7_DAYS') { [startDateOffset, endDateOffset] = [14, 8]; }
+    else if (dateRange === 'LAST_30_DAYS') { [startDateOffset, endDateOffset] = [60, 31]; }
+    else { return dateRange; }
+    const startDate = new Date(); startDate.setDate(today.getDate() - startDateOffset);
+    const endDate = new Date(); endDate.setDate(today.getDate() - endDateOffset);
+    return `${formatDate(startDate)},${formatDate(endDate)}`;
+}
+
+function doesCampaignMatchIdentifiers(campaignName, identifiers) {
+    const lowerCaseCampaignName = campaignName.toLowerCase();
+    return identifiers.some(id => lowerCaseCampaignName.includes(id.toLowerCase()));
+}
+
+function sendPMaxSpendAlert(generalCost, comparisonSpend, comparisonName) {
+    const subject = 'Google Ads Alert: General PMax Spend Exceeds a Performance PMax Campaign';
+    const body = `Hello,\n\nFor "${CONFIG.SPEND_DATE_RANGE}", the total spend of your General PMax campaigns has exceeded your top performance PMax campaign.\n\n- Total General PMax Campaigns Spend: $${generalCost.toFixed(2)}\n- Top Performance PMax Campaign ("${comparisonName}") Spend: $${comparisonSpend.toFixed(2)}\n\nSee the spreadsheet for details:\n${CONFIG.SPREADSHEET_URL}\n`;
+    sendEmail(subject, body);
+}
+
+function populateSpendReportSheet(spreadsheet, data) {
+    const headers = ['Campaign Name', 'Status', 'Cost', 'Impressions', 'Clicks', 'CTR', 'Conversions', 'CPA', 'ROAS'];
+    writeToSheet(spreadsheet, CONFIG.SPEND_ANALYSIS_SHEETS.PERFORMANCE_REPORT, headers, data);
+}
+
+function populateSpendSummarySheet(spreadsheet, campaignData, totalCost) {
+    const summaryRows = campaignData.map(c => [ c.name, c.cost, (totalCost > 0) ? (c.cost / totalCost) : 0 ]).sort((a, b) => b[1] - a[1]);
+    const sheet = getOrCreateSheet(spreadsheet, CONFIG.SPEND_ANALYSIS_SHEETS.SPEND_SUMMARY);
+    sheet.clear();
+    sheet.getRange(1, 1, 1, 2).setValues([['Total Account Spend:', totalCost.toFixed(2)]]).setFontWeight('bold');
+    const headers = ['Campaign Name', 'Cost', '% of Total Spend'];
+    sheet.getRange(3, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    if (summaryRows.length > 0) {
+        const range = sheet.getRange(4, 1, summaryRows.length, summaryRows[0].length);
+        range.setValues(summaryRows);
+        range.getSheet().getRange(4, 2, summaryRows.length, 1).setNumberFormat('$#,##0.00');
+        range.getSheet().getRange(4, 3, summaryRows.length, 1).setNumberFormat('0.00%');
+    }
+    sheet.autoResizeColumn(1);
+}
+
+function populateRecommendationSheet(spreadsheet, data) {
+    data.sort((a, b) => b[3] - a[3]);
+    const headers = [ 'Campaign Name', 'Current Daily Budget', 'Limited by Budget?', 'Conv. Value (Current)', 'Conv. Value (Previous)', '% Change', 'Recommendation', 'Suggested Daily Budget Change ($)' ];
+    const sheet = getOrCreateSheet(spreadsheet, CONFIG.SPEND_ANALYSIS_SHEETS.BUDGET_RECOMMENDATIONS);
+    writeToSheet(spreadsheet, CONFIG.SPEND_ANALYSIS_SHEETS.BUDGET_RECOMMENDATIONS, headers, data, false);
+    if (data.length > 0) {
+        sheet.getRange(2, 2, data.length, 1).setNumberFormat('$#,##0.00');
+        sheet.getRange(2, 4, data.length, 2).setNumberFormat('$#,##0.00');
+        sheet.getRange(2, 6, data.length, 1).setNumberFormat('0.00%');
+        sheet.getRange(2, 8, data.length, 1).setNumberFormat('$#,##0.00');
+    }
+}
+
+// ===================================================================================
+// --- SHARED UTILITY FUNCTIONS ---
+// ===================================================================================
+function sendEmail(subject, body, isHtml = false) {
+    if (!CONFIG.EMAIL_RECIPIENTS || CONFIG.EMAIL_RECIPIENTS.toLowerCase().includes('your_email_here')) {
+        Logger.log(`Warning: EMAIL_RECIPIENTS not set. Cannot send email: "${subject}"`);
+        return;
+    }
+    try {
+        const options = { to: CONFIG.EMAIL_RECIPIENTS, subject };
+        if (isHtml) { options.htmlBody = body; } else { options.body = body; }
+        MailApp.sendEmail(options);
+        Logger.log(`Successfully sent email with subject: "${subject}"`);
+    } catch (e) {
+        Logger.log(`Failed to send email. Error: ${e.message}`);
+    }
+}
+
+function writeToSheet(ss, sheetName, headers, dataRows, append = false) {
+    if (!dataRows || dataRows.length === 0) return;
+    const sheet = getOrCreateSheet(ss, sheetName);
+    if (!append) { sheet.clear(); }
+    if (sheet.getLastRow() === 0) {
+        sheet.appendRow(headers);
+        sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+        sheet.setFrozenRows(1);
+        headers.forEach((_, i) => sheet.autoResizeColumn(i + 1));
+    }
+    sheet.getRange(sheet.getLastRow() + 1, 1, dataRows.length, headers.length).setValues(dataRows);
+    Logger.log(`Wrote ${dataRows.length} rows to sheet: "${sheetName}"`);
+}
+
+function getSpreadsheet() {
+    try {
+        if (!CONFIG.SPREADSHEET_URL || CONFIG.SPREADSHEET_URL.toLowerCase().includes('your_spreadsheet_url_here')) {
+             throw new Error("SPREADSHEET_URL is not defined in CONFIG.");
+        }
+        return SpreadsheetApp.openByUrl(CONFIG.SPREADSHEET_URL);
+    } catch (e) {
+        Logger.log(`Failed to open spreadsheet. Error: ${e.message}`);
+        return null;
+    }
+}
+
+function getOrCreateSheet(ss, name) {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) {
+        sheet = ss.insertSheet(name);
+        Logger.log(`Created new sheet: "${name}"`);
+    }
+    return sheet;
+}
+
+function getFormattedTimestamp() {
+    const tz = AdsApp.currentAccount().getTimeZone();
+    return Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm:ss");
+}
