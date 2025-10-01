@@ -1,11 +1,12 @@
 // ===================================================================================
-// --- UNIFIED GOOGLE ADS ACCOUNT MONITOR SCRIPT (V10 - Final) ---
+// --- UNIFIED GOOGLE ADS ACCOUNT MONITOR SCRIPT (V11 - WITH CHANGE ALERTS) ---
 // ===================================================================================
-// This script combines four separate monitoring tasks into one:
+// This script combines five separate monitoring tasks into one:
 // 1. Disapproved Ads & Assets Monitor
 // 2. Out-of-Stock Product Monitor
 // 3. Disapproved Products Monitor
 // 4. Campaign Spend & Budget Analysis
+// 5. Unauthorized Change History Alert
 // ===================================================================================
 
 const CONFIG = {
@@ -46,6 +47,16 @@ const CONFIG = {
         CONVERSION_VALUE_CHANGE: 0.15, // 15% change to trigger a recommendation
         BUDGET_ADJUSTMENT_PERCENTAGE: 0.10, // Recommend a 10% budget change
     },
+
+    // --- 5. Change History Alert Settings ---
+    CHANGES_ALERT_SHEET: "Change History Alerts",
+    CHANGES_ALERT_IGNORE_USERS: [
+        'Bulk Actions',
+        'lucas.silva@quartile.com'
+        // Add other ignored user emails here, separated by commas
+    ],
+    CHANGES_ALERT_SEND_EMAIL: true,
+    CHANGES_ALERT_PERIOD: "YESTERDAY", // Time period to check for changes (e.g., YESTERDAY, LAST_7_DAYS)
 };
 
 // ===================================================================================
@@ -64,6 +75,7 @@ function main() {
         { name: "Out-of-Stock Product Monitor", func: runOutOfStockMonitor },
         { name: "Disapproved Products Monitor", func: runDisapprovedProductsMonitor },
         { name: "Campaign Spend & Budget Analysis", func: runCampaignSpendAnalysis },
+        { name: "Change History Alerts", func: runChangesAlert }, // <-- NEW TASK ADDED
     ];
 
     for (const task of tasks) {
@@ -119,7 +131,7 @@ function getDisapprovedStandardAds(timestamp) {
 }
 function getPmaxAssetIssues(timestamp) {
     const issues = []; const gaqlQuery = `SELECT campaign.name, asset_group.name, asset.id, asset.type, asset.text_asset.text, asset.image_asset.full_size.url, asset_group_asset.policy_summary.approval_status, asset_group_asset.policy_summary.policy_topic_entries FROM asset_group_asset WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX' AND campaign.status = 'ENABLED' AND asset_group.status = 'ENABLED'`;
-    const results = AdsApp.search(gaqlQuery); while (results.hasNext()) { const row = results.next(); const approvalStatus = row.assetGroupAsset.policySummary.approvalStatus; if (approvalStatus === 'DISAPPROVED' || approvalStatus === 'APPROVED_LIMITED') { let assetDetails = 'N/A'; if (row.asset.textAsset && row.asset.textAsset.text) { assetDetails = row.asset.textAsset.text; } else if (row.asset.imageAsset && row.asset.imageAsset.fullSize.url) { assetDetails = row.asset.imageAsset.fullSize.url; } issues.push([timestamp, row.campaign.name, row.assetGroup.name, row.asset.id, row.asset.type, assetDetails, approvalStatus, parsePolicyFindings(row.assetGroupAsset.policySummary.policyTopicEntries)]); } } return issues;
+    const results = AdsApp.search(gaqlQuery); while (results.hasNext()) { const row = results.next(); const approvalStatus = row.assetGroupAsset.policySummary.approvalStatus; if (approvalStatus === 'DISAPPROVED' || approvalStatus === 'APPROVED_LIMITED') { let assetDetails = 'N/A'; if (row.asset.textAsset && row.asset.textAsset.text) { assetDetails = row.asset.textAsset.text; } else if (row.asset.imageAsset && row.asset.imageAsset.full_size.url) { assetDetails = row.asset.imageAsset.fullSize.url; } issues.push([timestamp, row.campaign.name, row.assetGroup.name, row.asset.id, row.asset.type, assetDetails, approvalStatus, parsePolicyFindings(row.assetGroupAsset.policySummary.policyTopicEntries)]); } } return issues;
 }
 function parsePolicyFindings(policyTopicEntries) {
     if (!policyTopicEntries || policyTopicEntries.length === 0) return "No policy topic found."; return policyTopicEntries.map(entry => entry.topic).join(", ");
@@ -429,6 +441,160 @@ function populateRecommendationSheet(spreadsheet, data) {
     }
 }
 
+
+// ===================================================================================
+// --- MODULE 5: CHANGE HISTORY ALERTS (NEWLY ADDED) ---
+// ===================================================================================
+
+function runChangesAlert(spreadsheet) {
+    Logger.log("Processing account for unauthorized changes: " + AdsApp.currentAccount().getName());
+
+    const changeAlerts = getChangeAlerts();
+
+    if (changeAlerts.length > 0) {
+        reportChangeAlerts(spreadsheet, changeAlerts);
+        sendChangeAlertEmail(changeAlerts.length);
+    } else {
+        Logger.log("No changes found by users outside of the ignored list.");
+    }
+}
+
+function getChangeAlerts() {
+    const accountName = AdsApp.currentAccount().getName();
+    const changes = [];
+    const ignoreUsers = CONFIG.CHANGES_ALERT_IGNORE_USERS;
+    const period = CONFIG.CHANGES_ALERT_PERIOD;
+
+    const query = `
+      SELECT campaign.name, ad_group.name, change_event.change_date_time, 
+      change_event.change_resource_type, change_event.changed_fields, 
+      change_event.client_type, change_event.new_resource, change_event.old_resource, 
+      change_event.resource_change_operation, change_event.resource_name, change_event.user_email 
+      FROM change_event 
+      WHERE change_event.change_date_time DURING ${period} 
+      AND change_event.user_email NOT IN ('${ignoreUsers.join("', '")}') 
+      ORDER BY change_event.change_date_time DESC 
+      LIMIT 9999`;
+
+    Logger.log("Change History Query: " + query);
+
+    try {
+        const result = AdsApp.search(query);
+        while (result.hasNext()) {
+            const row = result.next();
+            try {
+                const change = [
+                    row.changeEvent.changeDateTime,
+                    accountName,
+                    row.changeEvent.userEmail,
+                    row.changeEvent.clientType,
+                    row.campaign ? row.campaign.name : 'N/A',
+                    row.adGroup ? row.adGroup.name : 'N/A',
+                    row.changeEvent.changeResourceType,
+                    row.changeEvent.changedFields,
+                    row.changeEvent.newResource,
+                    row.changeEvent.oldResource,
+                    row.changeEvent.resourceChangeOperation
+                ];
+                changes.push(change);
+            } catch (e) {
+                Logger.log(`Issue parsing a change event row: ${e}`);
+            }
+        }
+    } catch (e) {
+        Logger.log(`### Issue retrieving results from search API for changes: ${e}`);
+    }
+
+    return changes;
+}
+
+function reportChangeAlerts(spreadsheet, changes) {
+    const sheet = prepareChangeAlertsSheet(spreadsheet);
+    if (!sheet) return;
+
+    if (changes.length > 0) {
+      sheet.insertRowsBefore(3, changes.length);
+      const range = sheet.getRange(3, 1, changes.length, changes[0].length);
+      range.setValues(changes);
+      Logger.log(`\nNumber of change alerts added to output sheet: ${changes.length}\n`);
+    } else {
+       Logger.log("No changes to add to the output sheet.");
+    }
+}
+
+function prepareChangeAlertsSheet(spreadsheet) {
+    const sheet = getOrCreateSheet(spreadsheet, CONFIG.CHANGES_ALERT_SHEET);
+    
+    // Clear old content except for header rows
+    if (sheet.getLastRow() > 2) {
+      sheet.getRange(3, 1, sheet.getLastRow() - 2, sheet.getLastColumn()).clear();
+    }
+    
+    addHeaderToChangesSheet(sheet);
+
+    // Set column widths
+    sheet.setColumnWidth(1, 150); // DateTime
+    sheet.setColumnWidth(2, 200); // Account Name
+    sheet.setColumnWidth(3, 220); // User Email
+    sheet.setColumnWidth(4, 100); // Client Type
+    sheet.setColumnWidth(5, 200); // Campaign Name
+    sheet.setColumnWidth(6, 200); // AdGroup Name
+    sheet.setColumnWidth(7, 150); // Change Resource Type
+    sheet.setColumnWidth(8, 200); // Changed Fields
+    sheet.setColumnWidth(9, 150); // New Resource
+    sheet.setColumnWidth(10, 150); // Old Resource
+    sheet.setColumnWidth(11, 150); // Operation
+
+    return sheet;
+}
+
+function addHeaderToChangesSheet(sheet) {
+    try {
+        const headerSheet = SpreadsheetApp.openByUrl("https://docs.google.com/spreadsheets/d/1HnHwdCTeHGbedV-2gwed36U9YfUB9Bd45NFCFV5R4q4/").getSheetByName('header_sheet');
+        const headerRange = headerSheet.getRange(1, 1, 2, headerSheet.getLastColumn());
+        const headerData = headerRange.getValues();
+
+        const range = sheet.getRange(1, 1, 2, headerData[0].length);
+        range.clear().clearFormat();
+        range.setValues(headerData);
+        range.setFontWeight("bold");
+        sheet.getRange(1, 1, 1, headerData[0].length).setFontColor('#007BFF');
+        sheet.setFrozenRows(2);
+    } catch (e) {
+        const defaultHeaders = [
+            ["Date / Time", "Account", "User", "Tool", "Campaign", "Ad Group", "Change Type", "Item Changed", "New Value", "Removed Value", "Change"],
+            [" ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " "]
+        ];
+        sheet.getRange(1,1,2,defaultHeaders[0].length).setValues(defaultHeaders).setFontWeight("bold");
+        sheet.setFrozenRows(2);
+        Logger.log(`Could not open the header template sheet due to error: ${e}. Used default headers instead. ` + 
+                   `Please check permissions for https://docs.google.com/spreadsheets/d/1HnHwdCTeHGbedV-2gwed36U9YfUB9Bd45NFCFV5R4q4/`);
+    }
+}
+
+
+function sendChangeAlertEmail(numberOfAlerts) {
+    if (!CONFIG.CHANGES_ALERT_SEND_EMAIL) return;
+
+    const accountName = AdsApp.currentAccount().getName();
+    const subject = `[GAds Script] - WARNING - Unauthorized Change Detected in ${accountName}`;
+    const emailBody = `
+        ${numberOfAlerts} changes were made in the account "${accountName}" by users not on the ignored list.
+
+        This script checks the 'Change history' for all changes made during the last ${CONFIG.CHANGES_ALERT_PERIOD}.
+        It alerts you if any changes were made by users other than: ${CONFIG.CHANGES_ALERT_IGNORE_USERS.join(', ')}.
+
+        See the full details in the Google Sheet:
+        ${CONFIG.SPREADSHEET_URL}
+
+        This is an automated notification.
+    `;
+    sendEmail(subject, emailBody.trim());
+    Logger.log("Sending change alert email.");
+}
+
+
+
 // ===================================================================================
 // --- SHARED UTILITY FUNCTIONS ---
 // ===================================================================================
@@ -451,13 +617,15 @@ function writeToSheet(ss, sheetName, headers, dataRows, append = false) {
     if (!dataRows || dataRows.length === 0) return;
     const sheet = getOrCreateSheet(ss, sheetName);
     if (!append) { sheet.clear(); }
-    if (sheet.getLastRow() === 0) {
+    if (sheet.getLastRow() === 0 || !append) {
+        if (!append) sheet.clear();
         sheet.appendRow(headers);
         sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
         sheet.setFrozenRows(1);
         headers.forEach((_, i) => sheet.autoResizeColumn(i + 1));
     }
-    sheet.getRange(sheet.getLastRow() + 1, 1, dataRows.length, headers.length).setValues(dataRows);
+    const startRow = append ? sheet.getLastRow() + 1 : 2;
+    sheet.getRange(startRow, 1, dataRows.length, headers.length).setValues(dataRows);
     Logger.log(`Wrote ${dataRows.length} rows to sheet: "${sheetName}"`);
 }
 
