@@ -57,7 +57,7 @@ const CONFIG = {
         // Add other ignored user emails here, separated by commas
     ],
     CHANGES_ALERT_SEND_EMAIL: true,
-    CHANGES_ALERT_PERIOD: "YESTERDAY", // Time period to check for changes (e.g., YESTERDAY, LAST_7_DAYS)
+    CHANGES_ALERT_PERIOD: "LAST_7_DAYS", // Time period to check for changes (e.g., YESTERDAY, LAST_7_DAYS)
 };
 
 // ===================================================================================
@@ -799,3 +799,4 @@ function getFormattedTimestamp() {
     const tz = AdsApp.currentAccount().getTimeZone();
     return Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm:ss");
 }
+
