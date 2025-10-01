@@ -1,9 +1,9 @@
 // ===================================================================================
-// --- UNIFIED GOOGLE ADS ACCOUNT MONITOR SCRIPT (V11 - WITH CHANGE ALERTS) ---
+// --- UNIFIED GOOGLE ADS ACCOUNT MONITOR SCRIPT (V12.1 - OOS HEADER FIX) ---
 // ===================================================================================
 // This script combines five separate monitoring tasks into one:
 // 1. Disapproved Ads & Assets Monitor
-// 2. Out-of-Stock Product Monitor
+// 2. Out-of-Stock Product Monitor (with performance data)
 // 3. Disapproved Products Monitor
 // 4. Campaign Spend & Budget Analysis
 // 5. Unauthorized Change History Alert
@@ -26,6 +26,7 @@ const CONFIG = {
         OOS_IDS: "Out of Stock IDs",
     },
     OOS_ALERT_THRESHOLD: 0.10, // Alert on a 10% increase in out-of-stock items
+    OOS_PERFORMANCE_DATE_RANGE: 'LAST_30_DAYS', // Lookback period for OOS product performance (e.g., LAST_7_DAYS, LAST_30_DAYS)
 
     // --- 3. Disapproved Products Monitor Settings ---
     DISAPPROVED_PRODUCTS_SHEET: "Disapproved Products Report",
@@ -75,7 +76,7 @@ function main() {
         { name: "Out-of-Stock Product Monitor", func: runOutOfStockMonitor },
         { name: "Disapproved Products Monitor", func: runDisapprovedProductsMonitor },
         { name: "Campaign Spend & Budget Analysis", func: runCampaignSpendAnalysis },
-        { name: "Change History Alerts", func: runChangesAlert }, // <-- NEW TASK ADDED
+        { name: "Change History Alerts", func: runChangesAlert },
     ];
 
     for (const task of tasks) {
@@ -141,30 +142,195 @@ function parsePolicyFindings(policyTopicEntries) {
 // --- MODULE 2: OUT-OF-STOCK PRODUCT MONITOR ---
 // ===================================================================================
 function runOutOfStockMonitor(spreadsheet) {
-    const productData = getProductInventoryData(); const accountName = AdsApp.currentAccount().getName(); const accountId = AdsApp.currentAccount().getCustomerId(); const summarySheet = getOrCreateSheet(spreadsheet, CONFIG.OOS_CHECK_SHEETS.SUMMARY); const oosSheet = getOrCreateSheet(spreadsheet, CONFIG.OOS_CHECK_SHEETS.OOS_IDS);
-    setupOOSSummarySheet(summarySheet); setupOutOfStockIDSheet(oosSheet); const outOfStockCount = productData.outOfStockProducts.length; const totalProducts = productData.totalProducts; const outOfStockPercentage = totalProducts > 0 ? (outOfStockCount / totalProducts) : 0; const currentRunData = { timestamp: new Date(), accountId, accountName, totalProducts, outOfStockCount, outOfStockPercentage, outOfStockProductIDs: productData.outOfStockProducts };
-    const nextRow = summarySheet.getLastRow() + 1; const summaryRowData = [accountId, accountName, currentRunData.timestamp, totalProducts, outOfStockCount, outOfStockPercentage]; summarySheet.getRange(nextRow, 1, 1, summaryRowData.length).setValues([summaryRowData]); summarySheet.getRange(nextRow, 6).setNumberFormat('0.00%'); Logger.log(`OOS summary data added to row ${nextRow}.`);
-    populateOutOfStockIDSheet(oosSheet, currentRunData.outOfStockProductIDs); checkAndSendOOSAlert(summarySheet, currentRunData);
+    const productData = getProductInventoryData();
+    const accountName = AdsApp.currentAccount().getName();
+    const accountId = AdsApp.currentAccount().getCustomerId();
+    const summarySheet = getOrCreateSheet(spreadsheet, CONFIG.OOS_CHECK_SHEETS.SUMMARY);
+    const oosSheet = getOrCreateSheet(spreadsheet, CONFIG.OOS_CHECK_SHEETS.OOS_IDS);
+    
+    setupOOSSummarySheet(summarySheet);
+    setupOutOfStockIDSheet(oosSheet); // Updated to handle new columns
+
+    const outOfStockIds = productData.outOfStockProducts;
+    let oosDataForSheet = [];
+    if (outOfStockIds.length > 0) {
+        const performanceData = getProductPerformanceData(outOfStockIds, CONFIG.OOS_PERFORMANCE_DATE_RANGE);
+        oosDataForSheet = outOfStockIds.map(id => {
+            const perf = performanceData[id] || { convValue: 0, roas: 0 };
+            return [id, perf.convValue, perf.roas];
+        });
+        // Sort by conversion value descending
+        oosDataForSheet.sort((a, b) => b[1] - a[1]);
+    }
+    
+    const outOfStockCount = outOfStockIds.length;
+    const totalProducts = productData.totalProducts;
+    const outOfStockPercentage = totalProducts > 0 ? (outOfStockCount / totalProducts) : 0;
+    
+    const currentRunData = {
+        timestamp: new Date(),
+        accountId,
+        accountName,
+        totalProducts,
+        outOfStockCount,
+        outOfStockPercentage
+    };
+    
+    const nextRow = summarySheet.getLastRow() + 1;
+    const summaryRowData = [accountId, accountName, currentRunData.timestamp, totalProducts, outOfStockCount, outOfStockPercentage];
+    summarySheet.getRange(nextRow, 1, 1, summaryRowData.length).setValues([summaryRowData]);
+    summarySheet.getRange(nextRow, 6).setNumberFormat('0.00%');
+    Logger.log(`OOS summary data added to row ${nextRow}.`);
+    
+    populateOutOfStockIDSheet(oosSheet, oosDataForSheet); 
+    checkAndSendOOSAlert(summarySheet, currentRunData);
 }
+
 function getProductInventoryData() {
-    let totalProducts = 0; let outOfStockProducts = []; const processedProducts = new Set(); const productQuery = `SELECT shopping_product.item_id, shopping_product.availability FROM shopping_product WHERE shopping_product.channel = 'ONLINE'`;
-    try { const results = AdsApp.search(productQuery); while (results.hasNext()) { const row = results.next(); const productId = row.shoppingProduct.itemId; if (processedProducts.has(productId)) continue; processedProducts.add(productId); totalProducts++; if (row.shoppingProduct.availability === 'OUT_OF_STOCK') { outOfStockProducts.push(productId); } } Logger.log(`Successfully fetched ${totalProducts} products from Merchant Center.`);
-    } catch (e) { Logger.log(`Could not run shopping_product query. Error: ${e}.`); return { totalProducts: 0, outOfStockProducts: [] }; } return { totalProducts, outOfStockProducts };
+    let totalProducts = 0;
+    let outOfStockProducts = [];
+    const processedProducts = new Set();
+    const productQuery = `SELECT shopping_product.item_id, shopping_product.availability FROM shopping_product WHERE shopping_product.channel = 'ONLINE'`;
+    try {
+        const results = AdsApp.search(productQuery);
+        while (results.hasNext()) {
+            const row = results.next();
+            const productId = row.shoppingProduct.itemId;
+            if (processedProducts.has(productId)) continue;
+            processedProducts.add(productId);
+            totalProducts++;
+            if (row.shoppingProduct.availability === 'OUT_OF_STOCK') {
+                outOfStockProducts.push(productId);
+            }
+        }
+        Logger.log(`Successfully fetched ${totalProducts} products from Merchant Center. Found ${outOfStockProducts.length} out of stock.`);
+    } catch (e) {
+        Logger.log(`Could not run shopping_product query. Error: ${e}.`);
+        return { totalProducts: 0, outOfStockProducts: [] };
+    }
+    return { totalProducts, outOfStockProducts };
 }
+
+function getProductPerformanceData(productIds, dateRange) {
+    const performanceData = {};
+    if (!productIds || productIds.length === 0) {
+        return performanceData;
+    }
+    
+    const BATCH_SIZE = 1000;
+    for (let i = 0; i < productIds.length; i += BATCH_SIZE) {
+        const batchIds = productIds.slice(i, i + BATCH_SIZE);
+        const query = `
+            SELECT segments.product_item_id, metrics.conversions_value, metrics.cost_micros
+            FROM shopping_performance_view
+            WHERE segments.date DURING ${dateRange}
+            AND segments.product_item_id IN ('${batchIds.join("', '")}')`;
+
+        try {
+            const results = AdsApp.search(query);
+            while (results.hasNext()) {
+                const row = results.next();
+                const id = row.segments.productItemId;
+                const convValue = row.metrics.conversionsValue;
+                const cost = row.metrics.costMicros / 1000000;
+                
+                if (!performanceData[id]) performanceData[id] = { convValue: 0, cost: 0 };
+                
+                performanceData[id].convValue += convValue;
+                performanceData[id].cost += cost;
+            }
+        } catch (e) {
+            Logger.log(`Failed to fetch performance data for a batch of products. Error: ${e}`);
+        }
+    }
+    
+    // Calculate final ROAS after summing up all data
+    for (const id in performanceData) {
+        if (performanceData[id].cost > 0) {
+            performanceData[id].roas = performanceData[id].convValue / performanceData[id].cost;
+        } else {
+            performanceData[id].roas = 0;
+        }
+    }
+    
+    Logger.log(`Fetched performance data for ${Object.keys(performanceData).length} out-of-stock products.`);
+    return performanceData;
+}
+
+
 function setupOOSSummarySheet(sheet) {
-    const headers = ['Account ID', 'Account Name', 'Timestamp', 'Total Products', 'Products Out of Stock', '% Out of Stock']; const firstRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0]; if (firstRow.join('') !== headers.join('')) { sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold'); headers.forEach((_, i) => sheet.autoResizeColumn(i + 1)); }
+    const headers = ['Account ID', 'Account Name', 'Timestamp', 'Total Products', 'Products Out of Stock', '% Out of Stock'];
+    const firstRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+    if (firstRow.join('') !== headers.join('')) {
+        sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+        headers.forEach((_, i) => sheet.autoResizeColumn(i + 1));
+    }
 }
+
+// ** THE CORRECTED FUNCTION **
 function setupOutOfStockIDSheet(sheet) {
-    const header = 'Product ID'; if (sheet.getRange(1, 1).getValue() !== header) { sheet.getRange(1, 1).setValue(header).setFontWeight('bold'); sheet.autoResizeColumn(1); }
+    const headers = [
+      'Product ID', 
+      `Conversion Value (${CONFIG.OOS_PERFORMANCE_DATE_RANGE})`, 
+      `ROAS (${CONFIG.OOS_PERFORMANCE_DATE_RANGE})`
+    ];
+    
+    // Get the values of the first row to compare
+    const currentHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+    const headersMatch = headers.every((header, i) => header === currentHeaders[i]);
+
+    if (!headersMatch) {
+        Logger.log("'Out of Stock IDs' headers are incorrect or outdated. Rewriting.");
+        // Clear the entire header row to ensure no old values remain
+        sheet.getRange(1, 1, 1, sheet.getMaxColumns()).clear();
+        sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+        headers.forEach((_, i) => sheet.autoResizeColumn(i + 1));
+    }
 }
-function populateOutOfStockIDSheet(sheet, oosProductIds) {
-    if (sheet.getLastRow() > 1) { sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).clearContent(); } if (oosProductIds && oosProductIds.length > 0) { const idsToWrite = oosProductIds.map(id => [id]); sheet.getRange(2, 1, idsToWrite.length, 1).setValues(idsToWrite); Logger.log(`Wrote ${oosProductIds.length} out-of-stock IDs to sheet.`); }
+
+
+function populateOutOfStockIDSheet(sheet, oosDataWithPerf) {
+    if (sheet.getLastRow() > 1) {
+        sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent().clearFormat();
+    }
+    if (oosDataWithPerf && oosDataWithPerf.length > 0) {
+        const range = sheet.getRange(2, 1, oosDataWithPerf.length, 3);
+        range.setValues(oosDataWithPerf);
+
+        // Apply formatting
+        sheet.getRange(2, 2, oosDataWithPerf.length, 1).setNumberFormat('$#,##0.00'); // Conversion Value
+        sheet.getRange(2, 3, oosDataWithPerf.length, 1).setNumberFormat('#,##0.00');  // ROAS
+
+        Logger.log(`Wrote ${oosDataWithPerf.length} out-of-stock IDs with performance data to sheet.`);
+    }
 }
+
+
 function checkAndSendOOSAlert(summarySheet, currentData) {
-    const lastRowIndex = summarySheet.getLastRow(); if (lastRowIndex < 3) { Logger.log('Not enough data for OOS comparison yet.'); return; }
-    const previousOutOfStockCount = summarySheet.getRange(lastRowIndex - 1, 5).getValue(); const currentOutOfStockCount = currentData.outOfStockCount; let percentageIncrease = null; let send = false; if (previousOutOfStockCount > 0) { percentageIncrease = (currentOutOfStockCount - previousOutOfStockCount) / previousOutOfStockCount; if (percentageIncrease >= CONFIG.OOS_ALERT_THRESHOLD) send = true; } else if (currentOutOfStockCount > 0) { send = true; }
-    if (send) { const increaseText = percentageIncrease !== null ? `${(percentageIncrease * 100).toFixed(1)}%` : 'from 0'; const subject = `🚨 Out-of-Stock Products Alert for ${currentData.accountName}: ${increaseText} increase`; const body = `<h2>Out-of-Stock Products Alert</h2><p><strong>Account:</strong> ${currentData.accountName} (${currentData.accountId})</p><p><strong>Comparison:</strong></p><ul><li><strong>Previous Run:</strong> ${previousOutOfStockCount} products out of stock</li><li><strong>Current Run:</strong> ${currentOutOfStockCount} products out of stock</li><li><strong>Change:</strong> ${increaseText} increase</li></ul><p>A full list of out-of-stock product IDs is in the <a href="${CONFIG.SPREADSHEET_URL}">spreadsheet</a>.</p>`; sendEmail(subject, body, true); Logger.log(`Out-of-stock alert sent. Change: ${increaseText}`); }
+    const lastRowIndex = summarySheet.getLastRow();
+    if (lastRowIndex < 3) {
+        Logger.log('Not enough data for OOS comparison yet.');
+        return;
+    }
+    const previousOutOfStockCount = summarySheet.getRange(lastRowIndex - 1, 5).getValue();
+    const currentOutOfStockCount = currentData.outOfStockCount;
+    let percentageIncrease = null;
+    let send = false;
+    if (previousOutOfStockCount > 0) {
+        percentageIncrease = (currentOutOfStockCount - previousOutOfStockCount) / previousOutOfStockCount;
+        if (percentageIncrease >= CONFIG.OOS_ALERT_THRESHOLD) send = true;
+    } else if (currentOutOfStockCount > 0) {
+        send = true;
+    }
+    if (send) {
+        const increaseText = percentageIncrease !== null ? `${(percentageIncrease * 100).toFixed(1)}%` : 'from 0';
+        const subject = `🚨 Out-of-Stock Products Alert for ${currentData.accountName}: ${increaseText} increase`;
+        const body = `<h2>Out-of-Stock Products Alert</h2><p><strong>Account:</strong> ${currentData.accountName} (${currentData.accountId})</p><p><strong>Comparison:</strong></p><ul><li><strong>Previous Run:</strong> ${previousOutOfStockCount} products out of stock</li><li><strong>Current Run:</strong> ${currentOutOfStockCount} products out of stock</li><li><strong>Change:</strong> ${increaseText} increase</li></ul><p>A full list of out-of-stock product IDs, prioritized by recent conversion value, is in the <a href="${CONFIG.SPREADSHEET_URL}">spreadsheet</a>.</p>`;
+        sendEmail(subject, body, true);
+        Logger.log(`Out-of-stock alert sent. Change: ${increaseText}`);
+    }
 }
+
 
 // ===================================================================================
 // --- MODULE 3: DISAPPROVED PRODUCTS MONITOR ---
@@ -193,13 +359,11 @@ function runDisapprovedProductsMonitor(spreadsheet) {
     checkAndSendDisapprovedProductsAlert(sheet, currentWeekData);
 }
 
-// *** MODIFIED FUNCTION V10 ***
 function getDisapprovedProductData() {
     let suspendedProducts = new Set();
     let totalProductIds = new Set();
     
     try {
-        // Step 1: Get the resource names of all disapproved product criteria.
         const disapprovedCriterionQuery = `
             SELECT ad_group_criterion.resource_name
             FROM ad_group_criterion
@@ -210,15 +374,13 @@ function getDisapprovedProductData() {
         const disapprovedCriterionResources = new Set();
         const disapprovedResults = AdsApp.search(disapprovedCriterionQuery);
         while (disapprovedResults.hasNext()) {
-            const row = disapprovedResults.next();
-            disapprovedCriterionResources.add(row.adGroupCriterion.resourceName);
+            disapprovedCriterionResources.add(disapprovedResults.next().adGroupCriterion.resourceName);
         }
         Logger.log(`Found ${disapprovedCriterionResources.size} disapproved product criteria.`);
         if (disapprovedCriterionResources.size === 0) {
-            return { totalProducts: 0, suspendedProducts: [] }; // Early exit if no disapprovals
+            return { totalProducts: 0, suspendedProducts: [] };
         }
 
-        // Step 2: Get all products and check if their criterion is in our disapproved set.
         const allProductsQuery = `
             SELECT segments.product_item_id, ad_group_criterion.resource_name
             FROM shopping_performance_view
@@ -229,8 +391,6 @@ function getDisapprovedProductData() {
             const row = allProductsResults.next();
             if (row.segments && row.segments.productItemId) {
                 totalProductIds.add(row.segments.productItemId);
-
-                // Check if this product's criterion is in our disapproval set
                 if (disapprovedCriterionResources.has(row.adGroupCriterion.resourceName)) {
                     suspendedProducts.add(row.segments.productItemId);
                 }
@@ -330,13 +490,7 @@ function runCampaignSpendAnalysis(spreadsheet) {
 }
 
 function getCampaignPerformanceData(dateRange, isPreviousPeriod) {
-    let dateClause;
-    if (dateRange.includes(',')) {
-        const [startDate, endDate] = dateRange.split(',');
-        dateClause = `segments.date BETWEEN '${startDate}' AND '${endDate}'`;
-    } else {
-        dateClause = `segments.date DURING ${dateRange}`;
-    }
+    const dateClause = dateRange.includes(',') ? `segments.date BETWEEN '${dateRange.split(',')[0]}' AND '${dateRange.split(',')[1]}'` : `segments.date DURING ${dateRange}`;
     const budgetFields = isPreviousPeriod ? "" : ", campaign_budget.amount_micros, metrics.search_budget_lost_impression_share";
     const query = `SELECT campaign.name, campaign.status, metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.ctr, metrics.conversions, metrics.cost_per_conversion, metrics.conversions_value ${budgetFields} FROM campaign WHERE ${dateClause} AND campaign.status != 'REMOVED'`;
     try {
@@ -370,14 +524,13 @@ function generateBudgetRecommendation(campaign, previousCampaign) {
     
     let recommendation = 'No Change';
     let budgetChangeAmount = 0;
-    const budgetChangePercentage = CONFIG.BUDGET_RECOMMENDATION_THRESHOLDS.BUDGET_ADJUSTMENT_PERCENTAGE;
-    const convValueChangeThreshold = CONFIG.BUDGET_RECOMMENDATION_THRESHOLDS.CONVERSION_VALUE_CHANGE;
-    if (isLimitedByBudget && convValueChange > convValueChangeThreshold) {
-        recommendation = `Increase by ${(budgetChangePercentage * 100)}%`;
-        budgetChangeAmount = campaign.dailyBudget * budgetChangePercentage;
-    } else if (convValueChange < -convValueChangeThreshold) {
-        recommendation = `Decrease by ${(budgetChangePercentage * 100)}%`;
-        budgetChangeAmount = - (campaign.dailyBudget * budgetChangePercentage);
+    const { BUDGET_ADJUSTMENT_PERCENTAGE, CONVERSION_VALUE_CHANGE } = CONFIG.BUDGET_RECOMMENDATION_THRESHOLDS;
+    if (isLimitedByBudget && convValueChange > CONVERSION_VALUE_CHANGE) {
+        recommendation = `Increase by ${(BUDGET_ADJUSTMENT_PERCENTAGE * 100)}%`;
+        budgetChangeAmount = campaign.dailyBudget * BUDGET_ADJUSTMENT_PERCENTAGE;
+    } else if (convValueChange < -CONVERSION_VALUE_CHANGE) {
+        recommendation = `Decrease by ${(BUDGET_ADJUSTMENT_PERCENTAGE * 100)}%`;
+        budgetChangeAmount = - (campaign.dailyBudget * BUDGET_ADJUSTMENT_PERCENTAGE);
     }
     return [ campaign.name, campaign.dailyBudget, (isLimitedByBudget ? 'Yes' : 'No'), currentConvValue, previousConvValue, convValueChange, recommendation, budgetChangeAmount ];
 }
@@ -443,7 +596,7 @@ function populateRecommendationSheet(spreadsheet, data) {
 
 
 // ===================================================================================
-// --- MODULE 5: CHANGE HISTORY ALERTS (NEWLY ADDED) ---
+// --- MODULE 5: CHANGE HISTORY ALERTS ---
 // ===================================================================================
 
 function runChangesAlert(spreadsheet) {
@@ -476,14 +629,12 @@ function getChangeAlerts() {
       ORDER BY change_event.change_date_time DESC 
       LIMIT 9999`;
 
-    Logger.log("Change History Query: " + query);
-
     try {
         const result = AdsApp.search(query);
         while (result.hasNext()) {
             const row = result.next();
             try {
-                const change = [
+                changes.push([
                     row.changeEvent.changeDateTime,
                     accountName,
                     row.changeEvent.userEmail,
@@ -495,8 +646,7 @@ function getChangeAlerts() {
                     row.changeEvent.newResource,
                     row.changeEvent.oldResource,
                     row.changeEvent.resourceChangeOperation
-                ];
-                changes.push(change);
+                ]);
             } catch (e) {
                 Logger.log(`Issue parsing a change event row: ${e}`);
             }
@@ -514,36 +664,20 @@ function reportChangeAlerts(spreadsheet, changes) {
 
     if (changes.length > 0) {
       sheet.insertRowsBefore(3, changes.length);
-      const range = sheet.getRange(3, 1, changes.length, changes[0].length);
-      range.setValues(changes);
-      Logger.log(`\nNumber of change alerts added to output sheet: ${changes.length}\n`);
-    } else {
-       Logger.log("No changes to add to the output sheet.");
+      sheet.getRange(3, 1, changes.length, changes[0].length).setValues(changes);
+      Logger.log(`Number of change alerts added to output sheet: ${changes.length}`);
     }
 }
 
 function prepareChangeAlertsSheet(spreadsheet) {
     const sheet = getOrCreateSheet(spreadsheet, CONFIG.CHANGES_ALERT_SHEET);
-    
-    // Clear old content except for header rows
     if (sheet.getLastRow() > 2) {
       sheet.getRange(3, 1, sheet.getLastRow() - 2, sheet.getLastColumn()).clear();
     }
-    
     addHeaderToChangesSheet(sheet);
 
-    // Set column widths
-    sheet.setColumnWidth(1, 150); // DateTime
-    sheet.setColumnWidth(2, 200); // Account Name
-    sheet.setColumnWidth(3, 220); // User Email
-    sheet.setColumnWidth(4, 100); // Client Type
-    sheet.setColumnWidth(5, 200); // Campaign Name
-    sheet.setColumnWidth(6, 200); // AdGroup Name
-    sheet.setColumnWidth(7, 150); // Change Resource Type
-    sheet.setColumnWidth(8, 200); // Changed Fields
-    sheet.setColumnWidth(9, 150); // New Resource
-    sheet.setColumnWidth(10, 150); // Old Resource
-    sheet.setColumnWidth(11, 150); // Operation
+    const widths = [150, 200, 220, 100, 200, 200, 150, 200, 150, 150, 150];
+    widths.forEach((width, i) => sheet.setColumnWidth(i + 1, width));
 
     return sheet;
 }
@@ -551,24 +685,16 @@ function prepareChangeAlertsSheet(spreadsheet) {
 function addHeaderToChangesSheet(sheet) {
     try {
         const headerSheet = SpreadsheetApp.openByUrl("https://docs.google.com/spreadsheets/d/1HnHwdCTeHGbedV-2gwed36U9YfUB9Bd45NFCFV5R4q4/").getSheetByName('header_sheet');
-        const headerRange = headerSheet.getRange(1, 1, 2, headerSheet.getLastColumn());
-        const headerData = headerRange.getValues();
-
+        const headerData = headerSheet.getRange(1, 1, 2, headerSheet.getLastColumn()).getValues();
         const range = sheet.getRange(1, 1, 2, headerData[0].length);
-        range.clear().clearFormat();
-        range.setValues(headerData);
-        range.setFontWeight("bold");
+        range.clear().clearFormat().setValues(headerData).setFontWeight("bold");
         sheet.getRange(1, 1, 1, headerData[0].length).setFontColor('#007BFF');
         sheet.setFrozenRows(2);
     } catch (e) {
-        const defaultHeaders = [
-            ["Date / Time", "Account", "User", "Tool", "Campaign", "Ad Group", "Change Type", "Item Changed", "New Value", "Removed Value", "Change"],
-            [" ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " "]
-        ];
+        const defaultHeaders = [["Date / Time", "Account", "User", "Tool", "Campaign", "Ad Group", "Change Type", "Item Changed", "New Value", "Removed Value", "Change"], [" ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " "]];
         sheet.getRange(1,1,2,defaultHeaders[0].length).setValues(defaultHeaders).setFontWeight("bold");
         sheet.setFrozenRows(2);
-        Logger.log(`Could not open the header template sheet due to error: ${e}. Used default headers instead. ` + 
-                   `Please check permissions for https://docs.google.com/spreadsheets/d/1HnHwdCTeHGbedV-2gwed36U9YfUB9Bd45NFCFV5R4q4/`);
+        Logger.log(`Could not open header template: ${e}. Used default headers. Check permissions for https://docs.google.com/spreadsheets/d/1HnHwdCTeHGbedV-2gwed36U9YfUB9Bd45NFCFV5R4q4/`);
     }
 }
 
@@ -578,17 +704,7 @@ function sendChangeAlertEmail(numberOfAlerts) {
 
     const accountName = AdsApp.currentAccount().getName();
     const subject = `[GAds Script] - WARNING - Unauthorized Change Detected in ${accountName}`;
-    const emailBody = `
-        ${numberOfAlerts} changes were made in the account "${accountName}" by users not on the ignored list.
-
-        This script checks the 'Change history' for all changes made during the last ${CONFIG.CHANGES_ALERT_PERIOD}.
-        It alerts you if any changes were made by users other than: ${CONFIG.CHANGES_ALERT_IGNORE_USERS.join(', ')}.
-
-        See the full details in the Google Sheet:
-        ${CONFIG.SPREADSHEET_URL}
-
-        This is an automated notification.
-    `;
+    const emailBody = `${numberOfAlerts} changes were made in the account "${accountName}" by users not on the ignored list.\n\nThis script checks the 'Change history' for all changes made during the last ${CONFIG.CHANGES_ALERT_PERIOD}.\nIt alerts you if any changes were made by users other than: ${CONFIG.CHANGES_ALERT_IGNORE_USERS.join(', ')}.\n\nSee the full details in the Google Sheet:\n${CONFIG.SPREADSHEET_URL}\n\nThis is an automated notification.`;
     sendEmail(subject, emailBody.trim());
     Logger.log("Sending change alert email.");
 }
@@ -604,9 +720,7 @@ function sendEmail(subject, body, isHtml = false) {
         return;
     }
     try {
-        const options = { to: CONFIG.EMAIL_RECIPIENTS, subject };
-        if (isHtml) { options.htmlBody = body; } else { options.body = body; }
-        MailApp.sendEmail(options);
+        MailApp.sendEmail({ to: CONFIG.EMAIL_RECIPIENTS, subject, body: isHtml ? undefined : body, htmlBody: isHtml ? body : undefined });
         Logger.log(`Successfully sent email with subject: "${subject}"`);
     } catch (e) {
         Logger.log(`Failed to send email. Error: ${e.message}`);
@@ -619,8 +733,9 @@ function writeToSheet(ss, sheetName, headers, dataRows, append = false) {
     if (!append) { sheet.clear(); }
     if (sheet.getLastRow() === 0 || !append) {
         if (!append) sheet.clear();
-        sheet.appendRow(headers);
-        sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+        const headerRange = sheet.getRange(1, 1, 1, headers.length);
+        headerRange.setValues([headers]);
+        headerRange.setFontWeight('bold');
         sheet.setFrozenRows(1);
         headers.forEach((_, i) => sheet.autoResizeColumn(i + 1));
     }
