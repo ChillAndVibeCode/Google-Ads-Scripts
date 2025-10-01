@@ -53,7 +53,7 @@ const CONFIG = {
     CHANGES_ALERT_SHEET: "Change History Alerts",
     CHANGES_ALERT_IGNORE_USERS: [
         'Bulk Actions',
-        'lucas.silva@quartile.com'
+        'YOUR_EMAIL_HERE'
         // Add other ignored user emails here, separated by commas
     ],
     CHANGES_ALERT_SEND_EMAIL: true,
@@ -799,4 +799,5 @@ function getFormattedTimestamp() {
     const tz = AdsApp.currentAccount().getTimeZone();
     return Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm:ss");
 }
+
 
