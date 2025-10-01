@@ -1,5 +1,5 @@
 // ===================================================================================
-// --- UNIFIED GOOGLE ADS ACCOUNT MONITOR SCRIPT (V12.1 - OOS HEADER FIX) ---
+// --- UNIFIED GOOGLE ADS ACCOUNT MONITOR SCRIPT (V12.2 - PMAX ASSET FIX) ---
 // ===================================================================================
 // This script combines five separate monitoring tasks into one:
 // 1. Disapproved Ads & Assets Monitor
@@ -130,10 +130,44 @@ function getDisapprovedStandardAds(timestamp) {
     const issues = []; const gaqlQuery = `SELECT campaign.name, ad_group.name, ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.policy_summary.approval_status, ad_group_ad.policy_summary.policy_topic_entries FROM ad_group_ad WHERE ad_group_ad.policy_summary.approval_status = 'DISAPPROVED' AND campaign.advertising_channel_type NOT IN ('PERFORMANCE_MAX') AND campaign.status = 'ENABLED' AND ad_group.status = 'ENABLED'`;
     const results = AdsApp.search(gaqlQuery); while (results.hasNext()) { const row = results.next(); issues.push([timestamp, row.campaign.name, row.adGroup.name, row.adGroupAd.ad.id, row.adGroupAd.ad.type, row.adGroupAd.policySummary.approvalStatus, parsePolicyFindings(row.adGroupAd.policySummary.policyTopicEntries)]); } return issues;
 }
+
+// ** THE CORRECTED FUNCTION **
 function getPmaxAssetIssues(timestamp) {
-    const issues = []; const gaqlQuery = `SELECT campaign.name, asset_group.name, asset.id, asset.type, asset.text_asset.text, asset.image_asset.full_size.url, asset_group_asset.policy_summary.approval_status, asset_group_asset.policy_summary.policy_topic_entries FROM asset_group_asset WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX' AND campaign.status = 'ENABLED' AND asset_group.status = 'ENABLED'`;
-    const results = AdsApp.search(gaqlQuery); while (results.hasNext()) { const row = results.next(); const approvalStatus = row.assetGroupAsset.policySummary.approvalStatus; if (approvalStatus === 'DISAPPROVED' || approvalStatus === 'APPROVED_LIMITED') { let assetDetails = 'N/A'; if (row.asset.textAsset && row.asset.textAsset.text) { assetDetails = row.asset.textAsset.text; } else if (row.asset.imageAsset && row.asset.imageAsset.full_size.url) { assetDetails = row.asset.imageAsset.fullSize.url; } issues.push([timestamp, row.campaign.name, row.assetGroup.name, row.asset.id, row.asset.type, assetDetails, approvalStatus, parsePolicyFindings(row.assetGroupAsset.policySummary.policyTopicEntries)]); } } return issues;
+    const issues = []; 
+    const gaqlQuery = `SELECT campaign.name, asset_group.name, asset.id, asset.type, asset.text_asset.text, asset.image_asset.full_size.url, asset_group_asset.policy_summary.approval_status, asset_group_asset.policy_summary.policy_topic_entries FROM asset_group_asset WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX' AND campaign.status = 'ENABLED' AND asset_group.status = 'ENABLED'`;
+    
+    const results = AdsApp.search(gaqlQuery); 
+    while (results.hasNext()) { 
+        const row = results.next(); 
+        const approvalStatus = row.assetGroupAsset.policySummary.approvalStatus; 
+        
+        // Only process assets with actual policy issues
+        if (approvalStatus === 'DISAPPROVED' || approvalStatus === 'APPROVED_LIMITED') { 
+            let assetDetails = 'N/A'; // Default value
+
+            // Safely check for different asset types
+            if (row.asset && row.asset.textAsset && row.asset.textAsset.text) { 
+                assetDetails = row.asset.textAsset.text; 
+            } else if (row.asset && row.asset.imageAsset && row.asset.imageAsset.fullSize && row.asset.imageAsset.fullSize.url) { 
+                // This is the line that has been fixed to be more robust
+                assetDetails = row.asset.imageAsset.fullSize.url; 
+            }
+            
+            issues.push([
+                timestamp, 
+                row.campaign.name, 
+                row.assetGroup.name, 
+                row.asset.id, 
+                row.asset.type, 
+                assetDetails, 
+                approvalStatus, 
+                parsePolicyFindings(row.assetGroupAsset.policySummary.policyTopicEntries)
+            ]); 
+        } 
+    } 
+    return issues;
 }
+
 function parsePolicyFindings(policyTopicEntries) {
     if (!policyTopicEntries || policyTopicEntries.length === 0) return "No policy topic found."; return policyTopicEntries.map(entry => entry.topic).join(", ");
 }
@@ -267,7 +301,6 @@ function setupOOSSummarySheet(sheet) {
     }
 }
 
-// ** THE CORRECTED FUNCTION **
 function setupOutOfStockIDSheet(sheet) {
     const headers = [
       'Product ID', 
@@ -275,13 +308,11 @@ function setupOutOfStockIDSheet(sheet) {
       `ROAS (${CONFIG.OOS_PERFORMANCE_DATE_RANGE})`
     ];
     
-    // Get the values of the first row to compare
     const currentHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
     const headersMatch = headers.every((header, i) => header === currentHeaders[i]);
 
     if (!headersMatch) {
         Logger.log("'Out of Stock IDs' headers are incorrect or outdated. Rewriting.");
-        // Clear the entire header row to ensure no old values remain
         sheet.getRange(1, 1, 1, sheet.getMaxColumns()).clear();
         sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
         headers.forEach((_, i) => sheet.autoResizeColumn(i + 1));
@@ -297,7 +328,6 @@ function populateOutOfStockIDSheet(sheet, oosDataWithPerf) {
         const range = sheet.getRange(2, 1, oosDataWithPerf.length, 3);
         range.setValues(oosDataWithPerf);
 
-        // Apply formatting
         sheet.getRange(2, 2, oosDataWithPerf.length, 1).setNumberFormat('$#,##0.00'); // Conversion Value
         sheet.getRange(2, 3, oosDataWithPerf.length, 1).setNumberFormat('#,##0.00');  // ROAS
 
